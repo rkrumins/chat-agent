@@ -31,7 +31,7 @@ import {
   MenuItem,
   Tabs,
   Tab,
-  Input,
+  Checkbox,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -41,11 +41,18 @@ import UploadFileIcon from '@mui/icons-material/UploadFile';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import TextFieldsIcon from '@mui/icons-material/TextFields';
-import { documentsAPI, tasksAPI } from '../services/api';
+import { useHotkeys } from 'react-hotkeys-hook';
+import { documentsAPI, tasksAPI, bulkAPI } from '../services/api';
+import { notify } from '../utils/notifications';
+import DragDropZone from './common/DragDropZone';
+import SearchBar from './common/SearchBar';
+import { DocumentTableSkeleton } from './common/SkeletonLoader';
+import BulkActionToolbar from './common/BulkActionToolbar';
 
 const DocumentList = ({ onRefresh }) => {
   const { collectionName } = useParams();
   const [documents, setDocuments] = useState([]);
+  const [filteredDocuments, setFilteredDocuments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
@@ -54,6 +61,8 @@ const DocumentList = ({ onRefresh }) => {
   const [expandedRows, setExpandedRows] = useState({});
   const [processingTasks, setProcessingTasks] = useState({});
   const [uploadMethod, setUploadMethod] = useState(0); // 0 = text, 1 = file
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedDocuments, setSelectedDocuments] = useState([]);
 
   const [formData, setFormData] = useState({
     name: '',
@@ -74,8 +83,10 @@ const DocumentList = ({ onRefresh }) => {
       setError(null);
       const data = await documentsAPI.list(collectionName);
       setDocuments(data.documents || []);
+      setFilteredDocuments(data.documents || []);
     } catch (err) {
       setError('Failed to load documents');
+      notify.error('Failed to load documents');
       console.error('Error fetching documents:', err);
     } finally {
       setLoading(false);
@@ -87,6 +98,23 @@ const DocumentList = ({ onRefresh }) => {
       fetchDocuments();
     }
   }, [collectionName]);
+
+  // Search/filter functionality
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setFilteredDocuments(documents);
+      return;
+    }
+
+    const query = searchQuery.toLowerCase();
+    const filtered = documents.filter(doc => 
+      doc.metadata.name?.toLowerCase().includes(query) ||
+      doc.metadata.purpose?.toLowerCase().includes(query) ||
+      doc.metadata.tags?.toLowerCase().includes(query) ||
+      doc.content?.toLowerCase().includes(query)
+    );
+    setFilteredDocuments(filtered);
+  }, [searchQuery, documents]);
 
   // Poll for task status
   useEffect(() => {
@@ -147,17 +175,17 @@ const DocumentList = ({ onRefresh }) => {
 
   const handleCreateDocument = async () => {
     if (!formData.name.trim()) {
-      alert('Please provide a document name');
+      notify.warning('Please provide a document name');
       return;
     }
 
     if (uploadMethod === 0 && !formData.content.trim()) {
-      alert('Please provide text content');
+      notify.warning('Please provide text content');
       return;
     }
 
     if (uploadMethod === 1 && !selectedFile) {
-      alert('Please select a file to upload');
+      notify.warning('Please select a file to upload');
       return;
     }
 
@@ -207,6 +235,7 @@ const DocumentList = ({ onRefresh }) => {
             progress: 0,
           },
         }));
+        notify.info('Document processing started');
       }
 
       setCreateDialogOpen(false);
@@ -214,7 +243,7 @@ const DocumentList = ({ onRefresh }) => {
       await fetchDocuments();
       onRefresh();
     } catch (err) {
-      alert('Failed to create document: ' + (err.response?.data?.detail || err.message));
+      notify.error('Failed to create document: ' + (err.response?.data?.detail || err.message));
       console.error('Error creating document:', err);
     } finally {
       setSubmitting(false);
@@ -223,7 +252,7 @@ const DocumentList = ({ onRefresh }) => {
 
   const handleEditDocument = async () => {
     if (!formData.name.trim()) {
-      alert('Please fill in name');
+      notify.warning('Please fill in name');
       return;
     }
 
@@ -262,6 +291,9 @@ const DocumentList = ({ onRefresh }) => {
             progress: 0,
           },
         }));
+        notify.info('Document update processing started');
+      } else {
+        notify.success('Document updated successfully');
       }
 
       setEditDialogOpen(false);
@@ -270,7 +302,7 @@ const DocumentList = ({ onRefresh }) => {
       await fetchDocuments();
       onRefresh();
     } catch (err) {
-      alert('Failed to update document: ' + (err.response?.data?.detail || err.message));
+      notify.error('Failed to update document: ' + (err.response?.data?.detail || err.message));
       console.error('Error updating document:', err);
     } finally {
       setSubmitting(false);
@@ -284,10 +316,11 @@ const DocumentList = ({ onRefresh }) => {
 
     try {
       await documentsAPI.delete(collectionName, documentId);
+      notify.success('Document deleted successfully');
       await fetchDocuments();
       onRefresh();
     } catch (err) {
-      alert('Failed to delete document: ' + (err.response?.data?.detail || err.message));
+      notify.error('Failed to delete document: ' + (err.response?.data?.detail || err.message));
       console.error('Error deleting document:', err);
     }
   };
@@ -317,10 +350,93 @@ const DocumentList = ({ onRefresh }) => {
     }));
   };
 
+  // Bulk selection handlers
+  const handleSelectAll = (event) => {
+    if (event.target.checked) {
+      setSelectedDocuments(filteredDocuments.map(doc => doc.id));
+    } else {
+      setSelectedDocuments([]);
+    }
+  };
+
+  const handleSelectOne = (documentId) => {
+    setSelectedDocuments((prev) => {
+      if (prev.includes(documentId)) {
+        return prev.filter(id => id !== documentId);
+      } else {
+        return [...prev, documentId];
+      }
+    });
+  };
+
+  const handleBulkDelete = async () => {
+    try {
+      const result = await bulkAPI.deleteDocuments(collectionName, selectedDocuments);
+      notify.success(`Deleted ${result.deleted} of ${result.total} document(s)`);
+      
+      if (result.errors && result.errors.length > 0) {
+        notify.warning(`${result.errors.length} document(s) failed to delete`);
+      }
+      
+      setSelectedDocuments([]);
+      await fetchDocuments();
+      onRefresh();
+    } catch (err) {
+      notify.error('Failed to delete documents: ' + (err.response?.data?.detail || err.message));
+    }
+  };
+
+  const handleBulkUpdateTags = async (tags, mode) => {
+    try {
+      const result = await bulkAPI.updateTags(collectionName, selectedDocuments, tags, mode);
+      notify.success(`Updated tags for ${result.updated} of ${result.total} document(s)`);
+      
+      if (result.errors && result.errors.length > 0) {
+        notify.warning(`${result.errors.length} document(s) failed to update`);
+      }
+      
+      setSelectedDocuments([]);
+      await fetchDocuments();
+      onRefresh();
+    } catch (err) {
+      notify.error('Failed to update tags: ' + (err.response?.data?.detail || err.message));
+    }
+  };
+
+  const isSelected = (documentId) => selectedDocuments.includes(documentId);
+
+  // Keyboard shortcuts
+  useHotkeys('ctrl+n, cmd+n', (e) => {
+    e.preventDefault();
+    setCreateDialogOpen(true);
+  });
+
+  useHotkeys('ctrl+f, cmd+f', (e) => {
+    e.preventDefault();
+    // Focus search bar if it exists
+    const searchInput = document.querySelector('input[placeholder*="Search"]');
+    if (searchInput) searchInput.focus();
+  });
+
+  useHotkeys('escape', () => {
+    if (createDialogOpen) setCreateDialogOpen(false);
+    if (editDialogOpen) setEditDialogOpen(false);
+  });
+
   if (loading) {
     return (
-      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 400 }}>
-        <CircularProgress />
+      <Box>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
+          <Box>
+            <Typography variant="h4" component="h1" fontWeight="bold">
+              Documents
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              Collection: {collectionName}
+            </Typography>
+          </Box>
+        </Box>
+        <DocumentTableSkeleton />
       </Box>
     );
   }
@@ -345,6 +461,31 @@ const DocumentList = ({ onRefresh }) => {
           Add Document
         </Button>
       </Box>
+
+      {/* Search Bar */}
+      {documents.length > 0 && (
+        <Box sx={{ mb: 3 }}>
+          <SearchBar
+            value={searchQuery}
+            onChange={setSearchQuery}
+            placeholder="Search documents by name, purpose, tags, or content..."
+          />
+          {searchQuery && (
+            <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+              Found {filteredDocuments.length} of {documents.length} documents
+            </Typography>
+          )}
+        </Box>
+      )}
+
+      {/* Bulk Action Toolbar */}
+      <BulkActionToolbar
+        selectedCount={selectedDocuments.length}
+        onDelete={handleBulkDelete}
+        onUpdateTags={handleBulkUpdateTags}
+        onClear={() => setSelectedDocuments([])}
+        collectionName={collectionName}
+      />
 
       {error && (
         <Alert severity="error" sx={{ mb: 3 }}>
@@ -379,7 +520,7 @@ const DocumentList = ({ onRefresh }) => {
         </Box>
       )}
 
-      {documents.length === 0 ? (
+      {filteredDocuments.length === 0 && documents.length === 0 ? (
         <Card sx={{ textAlign: 'center', py: 8 }}>
           <CardContent>
             <DescriptionIcon sx={{ fontSize: 80, color: 'text.secondary', mb: 2 }} />
@@ -398,11 +539,36 @@ const DocumentList = ({ onRefresh }) => {
             </Button>
           </CardContent>
         </Card>
+      ) : filteredDocuments.length === 0 ? (
+        <Card sx={{ textAlign: 'center', py: 8 }}>
+          <CardContent>
+            <DescriptionIcon sx={{ fontSize: 80, color: 'text.secondary', mb: 2 }} />
+            <Typography variant="h6" color="text.secondary" gutterBottom>
+              No documents match your search
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+              Try different keywords or clear the search
+            </Typography>
+            <Button
+              variant="outlined"
+              onClick={() => setSearchQuery('')}
+            >
+              Clear Search
+            </Button>
+          </CardContent>
+        </Card>
       ) : (
         <TableContainer component={Paper} sx={{ borderRadius: 2 }}>
           <Table>
             <TableHead>
               <TableRow sx={{ bgcolor: 'grey.50' }}>
+                <TableCell padding="checkbox">
+                  <Checkbox
+                    indeterminate={selectedDocuments.length > 0 && selectedDocuments.length < filteredDocuments.length}
+                    checked={filteredDocuments.length > 0 && selectedDocuments.length === filteredDocuments.length}
+                    onChange={handleSelectAll}
+                  />
+                </TableCell>
                 <TableCell width={50}></TableCell>
                 <TableCell><strong>Name</strong></TableCell>
                 <TableCell><strong>Purpose</strong></TableCell>
@@ -413,9 +579,15 @@ const DocumentList = ({ onRefresh }) => {
               </TableRow>
             </TableHead>
             <TableBody>
-              {documents.map((doc) => (
+              {filteredDocuments.map((doc) => (
                 <React.Fragment key={doc.id}>
-                  <TableRow hover>
+                  <TableRow hover selected={isSelected(doc.id)}>
+                    <TableCell padding="checkbox">
+                      <Checkbox
+                        checked={isSelected(doc.id)}
+                        onChange={() => handleSelectOne(doc.id)}
+                      />
+                    </TableCell>
                     <TableCell>
                       <IconButton
                         size="small"
@@ -489,7 +661,7 @@ const DocumentList = ({ onRefresh }) => {
                     </TableCell>
                   </TableRow>
                   <TableRow>
-                    <TableCell colSpan={7} sx={{ py: 0, borderBottom: expandedRows[doc.id] ? undefined : 'none' }}>
+                    <TableCell colSpan={8} sx={{ py: 0, borderBottom: expandedRows[doc.id] ? undefined : 'none' }}>
                       <Collapse in={expandedRows[doc.id]} timeout="auto" unmountOnExit>
                         <Box sx={{ p: 2, bgcolor: 'grey.50' }}>
                           <Typography variant="subtitle2" gutterBottom>
@@ -587,22 +759,16 @@ const DocumentList = ({ onRefresh }) => {
             />
           ) : (
             <Box sx={{ mb: 2 }}>
-              <Typography variant="body2" gutterBottom>
-                Upload File * (PDF, DOCX, TXT, JSON)
-              </Typography>
-              <Input
-                type="file"
-                onChange={handleFileChange}
+              <DragDropZone
+                onFileSelect={setSelectedFile}
                 disabled={submitting}
-                inputProps={{
-                  accept: '.pdf,.docx,.doc,.txt,.json'
-                }}
-                fullWidth
               />
               {selectedFile && (
-                <Typography variant="caption" color="text.secondary">
-                  Selected: {selectedFile.name} ({(selectedFile.size / 1024).toFixed(2)} KB)
-                </Typography>
+                <Alert severity="success" sx={{ mt: 2 }}>
+                  <Typography variant="body2">
+                    <strong>Selected:</strong> {selectedFile.name} ({(selectedFile.size / 1024).toFixed(2)} KB)
+                  </Typography>
+                </Alert>
               )}
             </Box>
           )}

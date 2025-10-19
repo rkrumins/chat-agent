@@ -10,6 +10,7 @@ A standalone RAG (Retrieval Augmented Generation) chatbot built with Chainlit an
 - 💬 **Interactive UI**: Beautiful Chainlit interface
 - 📖 **Source Citations**: Shows which documents were used to answer
 - ⚡ **Fast & Efficient**: Optimized for quick responses
+- 🔄 **Manual Refresh Mode**: Say "refresh" anytime to reload latest documents (auto-refresh optional)
 
 ## Quick Start
 
@@ -32,6 +33,10 @@ nano .env  # Edit with your settings
 ```env
 # Point to your VectorDB
 CHROMA_DB_PATH=../backend/chroma_db
+
+# Cache mode - Manual (default) or Auto
+CACHE_AUTO_REFRESH=false  # Set to 'true' for automatic refresh
+CACHE_REFRESH_SECONDS=120  # Only used if auto-refresh enabled
 
 # Choose LLM provider
 LLM_PROVIDER=groq  # or gemini, or openai
@@ -109,6 +114,21 @@ Switch to a different collection
 /switch my-policies
 ```
 
+Automatically refreshes cache when switching to ensure latest documents.
+
+#### `/refresh` or just say **"refresh"**
+Reload latest documents from VectorDB immediately
+```
+/refresh
+```
+
+Or simply type any of these:
+- `refresh`
+- `reload`
+- `update`
+
+Use this after uploading new documents to make them immediately available.
+
 ### Regular Questions
 
 Just type your question naturally:
@@ -128,6 +148,8 @@ What are the security guidelines for handling customer data?
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CHROMA_DB_PATH` | Path to VectorDB | `../backend/chroma_db` |
+| `CACHE_AUTO_REFRESH` | Enable automatic refresh | `false` (manual mode) |
+| `CACHE_REFRESH_SECONDS` | Auto-refresh interval (if enabled) | `120` (2 minutes) |
 | `DEFAULT_COLLECTION` | Collection to load on start | None (uses first available) |
 | `LLM_PROVIDER` | LLM provider to use | `groq` |
 | `MODEL_NAME` | Model name | Provider-specific |

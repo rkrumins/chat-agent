@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import chromadb
 from chromadb.config import Settings
+from chromadb.utils import embedding_functions
 import uuid
 from datetime import datetime
 import asyncio
@@ -41,6 +42,12 @@ app.add_middleware(
 
 # Initialize ChromaDB client
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
+
+# Initialize embedding function (MUST match chatbot's embedding model!)
+# Using sentence-transformers model that chatbot uses
+embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
 # In-memory storage for processing status
 processing_status: Dict[str, Dict[str, Any]] = {}
@@ -283,10 +290,11 @@ async def process_document_async(
         processing_status[task_id]["progress"] = 50
         processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
         
-        # Get or create collection
+        # Get or create collection with embedding function
         collection = chroma_client.get_or_create_collection(
             name=collection_name,
-            metadata={"description": metadata.get("description", "")}
+            metadata={"description": metadata.get("description", "")},
+            embedding_function=embedding_function
         )
         
         # Simulate embedding generation
@@ -405,7 +413,8 @@ async def create_collection(collection: CollectionCreate):
                 "description": collection.description,
                 **collection.metadata,
                 "created_at": datetime.utcnow().isoformat()
-            }
+            },
+            embedding_function=embedding_function
         )
         return {
             "name": col.name,
@@ -440,7 +449,10 @@ async def list_documents(
 ):
     """List all documents in a collection (latest versions by default)"""
     try:
-        collection = chroma_client.get_collection(name=collection_name)
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
         
         # Get all non-chunk documents
         all_results = collection.get(include=["documents", "metadatas"])
@@ -490,7 +502,10 @@ async def list_documents(
 async def get_document(collection_name: str, document_id: str):
     """Get a specific document"""
     try:
-        collection = chroma_client.get_collection(name=collection_name)
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
         result = collection.get(
             ids=[document_id],
             include=["documents", "metadatas"]
@@ -528,7 +543,10 @@ async def create_document(
         if not document.content and not document.content.strip():
             raise HTTPException(status_code=400, detail="Content is required")
         
-        collection = chroma_client.get_or_create_collection(name=collection_name)
+        collection = chroma_client.get_or_create_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
         
         # Check if creating a new version
         version = 1
@@ -611,7 +629,10 @@ async def upload_document(
         if not content or not content.strip():
             raise HTTPException(status_code=400, detail="File appears to be empty or unreadable")
         
-        collection = chroma_client.get_or_create_collection(name=collection_name)
+        collection = chroma_client.get_or_create_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
         
         # Check if creating a new version
         version = 1
@@ -688,7 +709,10 @@ async def update_document(
 ):
     """Update an existing document"""
     try:
-        collection = chroma_client.get_collection(name=collection_name)
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
         
         # Get existing document
         existing = collection.get(
@@ -783,7 +807,10 @@ async def update_document(
 async def delete_document(collection_name: str, document_id: str):
     """Delete a document and its chunks"""
     try:
-        collection = chroma_client.get_collection(name=collection_name)
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
         
         # Try to delete document chunks if they exist
         try:
@@ -825,7 +852,10 @@ async def delete_document(collection_name: str, document_id: str):
 async def list_document_versions(collection_name: str, document_name: str):
     """Get all versions of a document by name"""
     try:
-        collection = chroma_client.get_collection(name=collection_name)
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
         all_results = collection.get(include=["documents", "metadatas"])
         
         versions = []
@@ -890,7 +920,10 @@ async def search_documents(
 ):
     """Search for similar documents in a collection"""
     try:
-        collection = chroma_client.get_collection(name=collection_name)
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
         
         results = collection.query(
             query_texts=[query],
@@ -915,6 +948,281 @@ async def search_documents(
         }
     except Exception as e:
         logger.error(f"Error searching documents: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Analytics endpoints
+
+@app.get("/analytics/stats")
+async def get_stats():
+    """Get overall system statistics"""
+    try:
+        collections = chroma_client.list_collections()
+        
+        total_collections = len(collections)
+        total_documents = 0
+        total_chunks = 0
+        collection_details = []
+        
+        for collection in collections:
+            col = chroma_client.get_collection(
+                name=collection.name,
+                embedding_function=embedding_function
+            )
+            all_items = col.get(include=["metadatas"])
+            
+            # Count actual documents (not chunks)
+            documents = [item for item in all_items['metadatas'] if not item.get('is_chunk', False)]
+            chunks = [item for item in all_items['metadatas'] if item.get('is_chunk', False)]
+            
+            doc_count = len(documents)
+            chunk_count = len(chunks)
+            
+            total_documents += doc_count
+            total_chunks += chunk_count
+            
+            collection_details.append({
+                "name": collection.name,
+                "document_count": doc_count,
+                "chunk_count": chunk_count,
+                "metadata": collection.metadata or {}
+            })
+        
+        return {
+            "total_collections": total_collections,
+            "total_documents": total_documents,
+            "total_chunks": total_chunks,
+            "collections": collection_details
+        }
+    except Exception as e:
+        logger.error(f"Error getting stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/recent-activity")
+async def get_recent_activity(limit: int = 10):
+    """Get recent activity (from task history)"""
+    try:
+        # Get recent completed tasks
+        recent_tasks = sorted(
+            processing_status.values(),
+            key=lambda x: x.get("updated_at", x.get("created_at", "")),
+            reverse=True
+        )[:limit]
+        
+        activities = []
+        for task in recent_tasks:
+            activity_type = "unknown"
+            if "create" in task.get("message", "").lower() or "upload" in task.get("message", "").lower():
+                activity_type = "upload"
+            elif "update" in task.get("message", "").lower():
+                activity_type = "update"
+            elif "delete" in task.get("message", "").lower():
+                activity_type = "delete"
+            
+            activities.append({
+                "type": activity_type,
+                "message": task.get("message", ""),
+                "status": task.get("status", ""),
+                "timestamp": task.get("updated_at", task.get("created_at", "")),
+                "collection": task.get("collection_name", "")
+            })
+        
+        return {"activities": activities}
+    except Exception as e:
+        logger.error(f"Error getting recent activity: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Tag management endpoints
+
+@app.get("/tags")
+async def get_all_tags():
+    """Get all unique tags across all collections"""
+    try:
+        collections = chroma_client.list_collections()
+        tag_counts = {}
+        
+        for collection in collections:
+            col = chroma_client.get_collection(
+                name=collection.name,
+                embedding_function=embedding_function
+            )
+            all_items = col.get(include=["metadatas"])
+            
+            for metadata in all_items['metadatas']:
+                if metadata.get('is_chunk', False):
+                    continue
+                    
+                tags_str = metadata.get('tags', '')
+                if tags_str:
+                    tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
+                    for tag in tags:
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        
+        # Sort by count (most popular first)
+        sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        return {
+            "tags": [{"tag": tag, "count": count} for tag, count in sorted_tags],
+            "total": len(sorted_tags)
+        }
+    except Exception as e:
+        logger.error(f"Error getting tags: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/collections/{collection_name}/tags")
+async def get_collection_tags(collection_name: str):
+    """Get all unique tags in a specific collection"""
+    try:
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
+        all_items = collection.get(include=["metadatas"])
+        
+        tag_counts = {}
+        for metadata in all_items['metadatas']:
+            if metadata.get('is_chunk', False):
+                continue
+                
+            tags_str = metadata.get('tags', '')
+            if tags_str:
+                tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
+                for tag in tags:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        
+        sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        return {
+            "collection": collection_name,
+            "tags": [{"tag": tag, "count": count} for tag, count in sorted_tags],
+            "total": len(sorted_tags)
+        }
+    except Exception as e:
+        logger.error(f"Error getting collection tags: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Bulk operations endpoints
+
+class BulkDeleteRequest(BaseModel):
+    document_ids: List[str]
+
+
+@app.post("/collections/{collection_name}/documents/bulk-delete")
+async def bulk_delete_documents(
+    collection_name: str,
+    request: BulkDeleteRequest
+):
+    """Delete multiple documents at once"""
+    try:
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
+        
+        deleted_count = 0
+        errors = []
+        
+        for doc_id in request.document_ids:
+            try:
+                # Get all items to find chunks
+                all_items = collection.get(include=["metadatas"])
+                
+                # Find chunks for this document
+                chunk_ids = []
+                for i, metadata in enumerate(all_items['metadatas']):
+                    if metadata.get('parent_id') == doc_id and metadata.get('is_chunk', False):
+                        chunk_ids.append(all_items['ids'][i])
+                
+                # Delete chunks
+                if chunk_ids:
+                    collection.delete(ids=chunk_ids)
+                
+                # Delete main document
+                collection.delete(ids=[doc_id])
+                deleted_count += 1
+                
+            except Exception as e:
+                errors.append({"document_id": doc_id, "error": str(e)})
+        
+        return {
+            "deleted": deleted_count,
+            "total": len(request.document_ids),
+            "errors": errors
+        }
+    except Exception as e:
+        logger.error(f"Error in bulk delete: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class BulkUpdateTagsRequest(BaseModel):
+    document_ids: List[str]
+    tags: str
+    mode: str = "replace"  # "replace", "append", or "remove"
+
+
+@app.post("/collections/{collection_name}/documents/bulk-update-tags")
+async def bulk_update_tags(
+    collection_name: str,
+    request: BulkUpdateTagsRequest
+):
+    """Update tags for multiple documents"""
+    try:
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
+        
+        updated_count = 0
+        errors = []
+        
+        for doc_id in request.document_ids:
+            try:
+                # Get current document
+                result = collection.get(ids=[doc_id], include=["metadatas"])
+                if not result['ids']:
+                    errors.append({"document_id": doc_id, "error": "Document not found"})
+                    continue
+                
+                current_metadata = result['metadatas'][0]
+                current_tags = current_metadata.get('tags', '')
+                
+                # Update tags based on mode
+                if request.mode == "replace":
+                    new_tags = request.tags
+                elif request.mode == "append":
+                    existing = set([t.strip() for t in current_tags.split(',') if t.strip()])
+                    new = set([t.strip() for t in request.tags.split(',') if t.strip()])
+                    new_tags = ', '.join(sorted(existing.union(new)))
+                elif request.mode == "remove":
+                    existing = set([t.strip() for t in current_tags.split(',') if t.strip()])
+                    to_remove = set([t.strip() for t in request.tags.split(',') if t.strip()])
+                    new_tags = ', '.join(sorted(existing - to_remove))
+                else:
+                    new_tags = request.tags
+                
+                # Update metadata
+                current_metadata['tags'] = new_tags
+                collection.update(
+                    ids=[doc_id],
+                    metadatas=[current_metadata]
+                )
+                
+                updated_count += 1
+                
+            except Exception as e:
+                errors.append({"document_id": doc_id, "error": str(e)})
+        
+        return {
+            "updated": updated_count,
+            "total": len(request.document_ids),
+            "errors": errors
+        }
+    except Exception as e:
+        logger.error(f"Error in bulk update tags: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

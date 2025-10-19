@@ -21,7 +21,10 @@ import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import FolderIcon from '@mui/icons-material/Folder';
 import { useNavigate } from 'react-router-dom';
+import { useHotkeys } from 'react-hotkeys-hook';
 import { collectionsAPI } from '../services/api';
+import { notify } from '../utils/notifications';
+import { CollectionCardSkeleton } from './common/SkeletonLoader';
 
 const CollectionList = ({ onRefresh }) => {
   const [collections, setCollections] = useState([]);
@@ -43,6 +46,7 @@ const CollectionList = ({ onRefresh }) => {
       setCollections(data.collections || []);
     } catch (err) {
       setError('Failed to load collections');
+      notify.error('Failed to load collections');
       console.error('Error fetching collections:', err);
     } finally {
       setLoading(false);
@@ -55,19 +59,20 @@ const CollectionList = ({ onRefresh }) => {
 
   const handleCreateCollection = async () => {
     if (!newCollection.name.trim()) {
-      alert('Please enter a collection name');
+      notify.warning('Please enter a collection name');
       return;
     }
 
     try {
       setCreating(true);
       await collectionsAPI.create(newCollection);
+      notify.success(`Collection "${newCollection.name}" created successfully`);
       setCreateDialogOpen(false);
       setNewCollection({ name: '', description: '' });
       await fetchCollections();
       onRefresh();
     } catch (err) {
-      alert('Failed to create collection: ' + err.message);
+      notify.error('Failed to create collection: ' + err.message);
       console.error('Error creating collection:', err);
     } finally {
       setCreating(false);
@@ -81,10 +86,11 @@ const CollectionList = ({ onRefresh }) => {
 
     try {
       await collectionsAPI.delete(collectionName);
+      notify.success(`Collection "${collectionName}" deleted successfully`);
       await fetchCollections();
       onRefresh();
     } catch (err) {
-      alert('Failed to delete collection: ' + err.message);
+      notify.error('Failed to delete collection: ' + err.message);
       console.error('Error deleting collection:', err);
     }
   };
@@ -93,10 +99,27 @@ const CollectionList = ({ onRefresh }) => {
     navigate(`/collections/${collection.name}/documents`);
   };
 
+  // Keyboard shortcuts
+  useHotkeys('ctrl+n, cmd+n', (e) => {
+    e.preventDefault();
+    setCreateDialogOpen(true);
+  });
+
   if (loading) {
     return (
-      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 400 }}>
-        <CircularProgress />
+      <Box>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
+          <Typography variant="h4" component="h1" fontWeight="bold">
+            Collections
+          </Typography>
+        </Box>
+        <Grid container spacing={3}>
+          {[...Array(6)].map((_, index) => (
+            <Grid item xs={12} sm={6} md={4} key={index}>
+              <CollectionCardSkeleton />
+            </Grid>
+          ))}
+        </Grid>
       </Box>
     );
   }

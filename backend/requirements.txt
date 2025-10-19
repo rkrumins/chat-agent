@@ -8,3 +8,5 @@ python-dotenv
 PyPDF2
 python-docx
 openpyxl
+numpy<2.0  # Fix NumPy compatibility with PyTorch
+sentence-transformers  # Required for embeddings (must match chatbot!)

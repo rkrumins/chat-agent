@@ -17,7 +17,10 @@ import {
 import FolderIcon from '@mui/icons-material/Folder';
 import HomeIcon from '@mui/icons-material/Home';
 import TaskIcon from '@mui/icons-material/Task';
+import DashboardIcon from '@mui/icons-material/Dashboard';
+import CollectionIcon from '@mui/icons-material/Collections';
 import { collectionsAPI } from '../services/api';
+import { SidebarSkeleton } from './common/SkeletonLoader';
 
 const DRAWER_WIDTH = 280;
 
@@ -51,9 +54,14 @@ const Sidebar = ({ open, onCollectionSelect, selectedCollection, refreshTrigger 
     navigate(`/collections/${collection.name}/documents`);
   };
 
-  const handleHomeClick = () => {
+  const handleDashboardClick = () => {
     onCollectionSelect(null);
     navigate('/');
+  };
+
+  const handleCollectionsClick = () => {
+    onCollectionSelect(null);
+    navigate('/collections');
   };
 
   const handleTasksClick = () => {
@@ -81,12 +89,23 @@ const Sidebar = ({ open, onCollectionSelect, selectedCollection, refreshTrigger 
           <ListItem disablePadding>
             <ListItemButton
               selected={location.pathname === '/'}
-              onClick={handleHomeClick}
+              onClick={handleDashboardClick}
             >
               <ListItemIcon>
-                <HomeIcon color={location.pathname === '/' ? 'primary' : 'inherit'} />
+                <DashboardIcon color={location.pathname === '/' ? 'primary' : 'inherit'} />
               </ListItemIcon>
-              <ListItemText primary="Home" />
+              <ListItemText primary="Dashboard" />
+            </ListItemButton>
+          </ListItem>
+          <ListItem disablePadding>
+            <ListItemButton
+              selected={location.pathname === '/collections'}
+              onClick={handleCollectionsClick}
+            >
+              <ListItemIcon>
+                <CollectionIcon color={location.pathname === '/collections' ? 'primary' : 'inherit'} />
+              </ListItemIcon>
+              <ListItemText primary="Collections" />
             </ListItemButton>
           </ListItem>
           <ListItem disablePadding>
@@ -111,9 +130,7 @@ const Sidebar = ({ open, onCollectionSelect, selectedCollection, refreshTrigger 
         </Box>
 
         {loading ? (
-          <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}>
-            <CircularProgress size={24} />
-          </Box>
+          <SidebarSkeleton />
         ) : error ? (
           <Box sx={{ p: 2 }}>
             <Alert severity="error" size="small">

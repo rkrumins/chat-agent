@@ -110,5 +110,47 @@ export const healthCheck = async () => {
   return response.data;
 };
 
+// Analytics API
+export const analyticsAPI = {
+  getStats: async () => {
+    const response = await api.get('/analytics/stats');
+    return response.data;
+  },
+  getRecentActivity: async (limit = 10) => {
+    const response = await api.get(`/analytics/recent-activity?limit=${limit}`);
+    return response.data;
+  },
+};
+
+// Tags API
+export const tagsAPI = {
+  getAll: async () => {
+    const response = await api.get('/tags');
+    return response.data;
+  },
+  getByCollection: async (collectionName) => {
+    const response = await api.get(`/collections/${collectionName}/tags`);
+    return response.data;
+  },
+};
+
+// Bulk operations API
+export const bulkAPI = {
+  deleteDocuments: async (collectionName, documentIds) => {
+    const response = await api.post(`/collections/${collectionName}/documents/bulk-delete`, {
+      document_ids: documentIds
+    });
+    return response.data;
+  },
+  updateTags: async (collectionName, documentIds, tags, mode = 'replace') => {
+    const response = await api.post(`/collections/${collectionName}/documents/bulk-update-tags`, {
+      document_ids: documentIds,
+      tags,
+      mode
+    });
+    return response.data;
+  },
+};
+
 export default api;
 

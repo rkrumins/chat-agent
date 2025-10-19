@@ -4,6 +4,14 @@ A complete vector database management system with:
 1. **VectorDB Manager**: Full-stack application for managing ChromaDB with React + Material UI and FastAPI
 2. **RAG Chatbot**: Standalone Chainlit chatbot for querying your documents using LangChain
 
+## ⚠️ Python Version Requirement
+
+**Required:** Python 3.10, 3.11, or 3.12  
+**Recommended:** Python 3.12  
+**Not Supported:** Python 3.13+ (PyTorch/sentence-transformers incompatibility)
+
+All Python services (backend and chatbot) must use the same compatible version.
+
 ## Features
 
 ### Core Functionality
@@ -58,9 +66,18 @@ chat-agent/
 ## Installation
 
 ### Prerequisites
-- Python 3.8+
+- **Python 3.10, 3.11, or 3.12** (⚠️ NOT 3.13+) - Required for sentence-transformers
 - Node.js 16+
 - npm or yarn
+
+**Install Python 3.12 (recommended):**
+```bash
+# macOS (Homebrew)
+brew install python@3.12
+
+# Verify
+python3.12 --version
+```
 
 ### Backend Setup
 
