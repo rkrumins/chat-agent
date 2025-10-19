@@ -81,10 +81,16 @@ const Dashboard = () => {
     chunks: col.chunk_count,
   })) || [];
 
-  const pieData = stats?.collections?.map((col) => ({
-    name: col.name,
-    value: col.document_count,
-  })) || [];
+  // Filter out collections with 0 documents for pie chart
+  const pieData = stats?.collections
+    ?.filter(col => col.document_count > 0)
+    .map((col) => ({
+      name: col.name,
+      value: col.document_count,
+    })) || [];
+
+  // Check if we have any data to display
+  const hasDocuments = stats?.total_documents > 0;
 
   const getActivityIcon = (type) => {
     switch (type) {
@@ -198,18 +204,42 @@ const Dashboard = () => {
                 <ResponsiveContainer width="100%" height={300}>
                   <BarChart data={collectionChartData}>
                     <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="name" />
-                    <YAxis />
-                    <Tooltip />
+                    <XAxis 
+                      dataKey="name" 
+                      angle={-45}
+                      textAnchor="end"
+                      height={80}
+                      interval={0}
+                    />
+                    <YAxis allowDecimals={false} />
+                    <Tooltip 
+                      formatter={(value, name) => {
+                        if (name === 'Documents') return [`${value} documents`, name];
+                        if (name === 'Chunks') return [`${value} chunks`, name];
+                        return [value, name];
+                      }}
+                    />
                     <Legend />
                     <Bar dataKey="documents" fill="#8884d8" name="Documents" />
                     <Bar dataKey="chunks" fill="#82ca9d" name="Chunks" />
                   </BarChart>
                 </ResponsiveContainer>
               ) : (
-                <Box sx={{ textAlign: 'center', py: 4 }}>
+                <Box sx={{ 
+                  textAlign: 'center', 
+                  py: 8,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  height: 300
+                }}>
+                  <FolderIcon sx={{ fontSize: 60, color: 'text.secondary', mb: 2, opacity: 0.3 }} />
                   <Typography variant="body2" color="text.secondary">
-                    No data available
+                    No collections yet
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Create a collection to get started
                   </Typography>
                 </Box>
               )}
@@ -224,7 +254,7 @@ const Dashboard = () => {
               <Typography variant="h6" gutterBottom>
                 Documents by Collection
               </Typography>
-              {pieData.length > 0 ? (
+              {hasDocuments && pieData.length > 0 ? (
                 <ResponsiveContainer width="100%" height={300}>
                   <PieChart>
                     <Pie
@@ -232,9 +262,11 @@ const Dashboard = () => {
                       cx="50%"
                       cy="50%"
                       labelLine={false}
-                      label={({ name, percent }) =>
-                        `${name}: ${(percent * 100).toFixed(0)}%`
-                      }
+                      label={({ name, percent, value }) => {
+                        // Only show label if percentage is significant (>3%)
+                        if (percent < 0.03) return '';
+                        return `${name}: ${(percent * 100).toFixed(0)}%`;
+                      }}
                       outerRadius={80}
                       fill="#8884d8"
                       dataKey="value"
@@ -246,13 +278,27 @@ const Dashboard = () => {
                         />
                       ))}
                     </Pie>
-                    <Tooltip />
+                    <Tooltip 
+                      formatter={(value, name) => [`${value} documents`, name]}
+                    />
                   </PieChart>
                 </ResponsiveContainer>
               ) : (
-                <Box sx={{ textAlign: 'center', py: 4 }}>
+                <Box sx={{ 
+                  textAlign: 'center', 
+                  py: 8,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  height: 300
+                }}>
+                  <DescriptionIcon sx={{ fontSize: 60, color: 'text.secondary', mb: 2, opacity: 0.3 }} />
                   <Typography variant="body2" color="text.secondary">
-                    No data available
+                    No documents yet
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Upload documents to see distribution
                   </Typography>
                 </Box>
               )}

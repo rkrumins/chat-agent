@@ -32,6 +32,7 @@ import {
   Tabs,
   Tab,
   Checkbox,
+  Grid,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -63,6 +64,8 @@ const DocumentList = ({ onRefresh }) => {
   const [uploadMethod, setUploadMethod] = useState(0); // 0 = text, 1 = file
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedDocuments, setSelectedDocuments] = useState([]);
+  const [advancedMode, setAdvancedMode] = useState(false);
+  const [selectedPreset, setSelectedPreset] = useState('default');
 
   const [formData, setFormData] = useState({
     name: '',
@@ -72,6 +75,9 @@ const DocumentList = ({ onRefresh }) => {
     custom_metadata: '',
     chunk_size: 500,
     chunk_overlap: 50,
+    separator: '\n\n',  // Advanced: custom separator
+    chunk_by: 'size',   // Advanced: 'size', 'lines', 'paragraphs', 'sentences'
+    max_chunks: null,   // Advanced: limit total chunks
   });
 
   const [selectedFile, setSelectedFile] = useState(null);
@@ -150,6 +156,65 @@ const DocumentList = ({ onRefresh }) => {
     return () => clearInterval(interval);
   }, [processingTasks]);
 
+  // Intelligent presets with use cases
+  const chunkPresets = {
+    'qa': {
+      name: 'Q&A / Definitions',
+      size: 200,
+      overlap: 20,
+      separator: '\n',
+      chunk_by: 'lines',
+      icon: '❓',
+      description: 'One question per chunk. Perfect for FAQ documents or glossaries.',
+      example: 'Q: What is X?\nA: X is...',
+      useCase: 'FAQs, glossaries, Q&A pairs'
+    },
+    'default': {
+      name: 'General Documents',
+      size: 500,
+      overlap: 50,
+      separator: '\n\n',
+      chunk_by: 'size',
+      icon: '📄',
+      description: 'Balanced chunking for most documents. Good for articles and general content.',
+      example: 'Regular paragraphs, mixed content',
+      useCase: 'Articles, guides, general docs'
+    },
+    'policy': {
+      name: 'Policies / Long Docs',
+      size: 800,
+      overlap: 100,
+      separator: '\n\n',
+      chunk_by: 'size',
+      icon: '📋',
+      description: 'Large chunks with more overlap. Best for detailed policies and procedures.',
+      example: 'Long sections with context',
+      useCase: 'Policies, manuals, legal docs'
+    },
+    'code': {
+      name: 'Code / Technical',
+      size: 400,
+      overlap: 40,
+      separator: '\n\n',
+      chunk_by: 'paragraphs',
+      icon: '💻',
+      description: 'Function/block-level chunking. Preserves code structure.',
+      example: 'Functions, classes, code blocks',
+      useCase: 'Code, API docs, technical specs'
+    },
+    'list': {
+      name: 'Lists / Line Items',
+      size: 100,
+      overlap: 0,
+      separator: '\n',
+      chunk_by: 'lines',
+      icon: '📝',
+      description: 'Each line is a chunk. No overlap. For item lists or short entries.',
+      example: '- Item 1\n- Item 2\n- Item 3',
+      useCase: 'To-do lists, inventories, catalogs'
+    }
+  };
+
   const resetForm = () => {
     setFormData({
       name: '',
@@ -159,18 +224,57 @@ const DocumentList = ({ onRefresh }) => {
       custom_metadata: '',
       chunk_size: 500,
       chunk_overlap: 50,
+      separator: '\n\n',
+      chunk_by: 'size',
+      max_chunks: null,
     });
     setSelectedFile(null);
     setUploadMethod(0);
+    setAdvancedMode(false);
+    setSelectedPreset('default');
+  };
+
+  const applyPreset = (presetKey) => {
+    const preset = chunkPresets[presetKey];
+    setSelectedPreset(presetKey);
+    setFormData({
+      ...formData,
+      chunk_size: preset.size,
+      chunk_overlap: preset.overlap,
+      separator: preset.separator,
+      chunk_by: preset.chunk_by,
+    });
   };
 
   const handleFileChange = (event) => {
     const file = event.target.files[0];
+    handleFileSelection(file);
+  };
+
+  const handleFileSelection = (file) => {
+    if (!file) return;
+    
     setSelectedFile(file);
-    if (file && !formData.name) {
-      // Auto-fill name from filename
-      setFormData({ ...formData, name: file.name });
+    
+    // Auto-fill name from filename, removing extension
+    const nameWithoutExt = file.name.replace(/\.[^/.]+$/, '');
+    
+    // Check if name already exists
+    const existingNames = documents.map(d => d.metadata.name);
+    let finalName = nameWithoutExt;
+    
+    if (existingNames.includes(finalName)) {
+      // Add timestamp to make unique
+      const timestamp = new Date().toLocaleString('en-US', { 
+        month: 'short', 
+        day: 'numeric', 
+        hour: '2-digit', 
+        minute: '2-digit' 
+      });
+      finalName = `${nameWithoutExt} (${timestamp})`;
     }
+    
+    setFormData({ ...formData, name: finalName });
   };
 
   const handleCreateDocument = async () => {
@@ -760,7 +864,7 @@ const DocumentList = ({ onRefresh }) => {
           ) : (
             <Box sx={{ mb: 2 }}>
               <DragDropZone
-                onFileSelect={setSelectedFile}
+                onFileSelect={handleFileSelection}
                 disabled={submitting}
               />
               {selectedFile && (
@@ -768,44 +872,179 @@ const DocumentList = ({ onRefresh }) => {
                   <Typography variant="body2">
                     <strong>Selected:</strong> {selectedFile.name} ({(selectedFile.size / 1024).toFixed(2)} KB)
                   </Typography>
+                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                    Document name: {formData.name}
+                  </Typography>
                 </Alert>
               )}
             </Box>
           )}
 
-          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 2 }}>
-            <TextField
-              margin="dense"
-              label="Chunk Size"
-              type="number"
-              value={formData.chunk_size}
-              onChange={(e) =>
-                setFormData({ ...formData, chunk_size: parseInt(e.target.value) || 500 })
-              }
-              disabled={submitting}
-              helperText="Characters per chunk"
-            />
-            <TextField
-              margin="dense"
-              label="Chunk Overlap"
-              type="number"
-              value={formData.chunk_overlap}
-              onChange={(e) =>
-                setFormData({ ...formData, chunk_overlap: parseInt(e.target.value) || 50 })
-              }
-              disabled={submitting}
-              helperText="Overlap between chunks"
-            />
-          </Box>
+          <Box sx={{ mb: 2 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+              <Typography variant="subtitle2">
+                Chunking Strategy
+              </Typography>
+              <Button
+                size="small"
+                onClick={() => setAdvancedMode(!advancedMode)}
+                sx={{ textTransform: 'none' }}
+              >
+                {advancedMode ? '← Basic' : 'Advanced →'}
+              </Button>
+            </Box>
 
-          <Alert severity="info" sx={{ mb: 2 }}>
-            <Typography variant="caption">
-              <strong>Chunk Size Tips:</strong><br/>
-              • Policies/Long docs: 800-1000 with 100 overlap<br/>
-              • General docs: 500 with 50 overlap (default)<br/>
-              • Definitions/Short: 200-300 with 20 overlap
-            </Typography>
-          </Alert>
+            {!advancedMode ? (
+              // BASIC MODE - Smart Presets
+              <>
+                <Grid container spacing={2} sx={{ mb: 2 }}>
+                  {Object.entries(chunkPresets).map(([key, preset]) => (
+                    <Grid item xs={12} sm={6} key={key}>
+                      <Card
+                        sx={{
+                          cursor: 'pointer',
+                          border: selectedPreset === key ? 2 : 1,
+                          borderColor: selectedPreset === key ? 'primary.main' : 'divider',
+                          bgcolor: selectedPreset === key ? 'primary.50' : 'background.paper',
+                          transition: 'all 0.2s',
+                          '&:hover': {
+                            borderColor: 'primary.main',
+                            transform: 'translateY(-2px)',
+                          },
+                        }}
+                        onClick={() => applyPreset(key)}
+                      >
+                        <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
+                            <Typography variant="h6" sx={{ mr: 1 }}>
+                              {preset.icon}
+                            </Typography>
+                            <Typography variant="subtitle2" fontWeight="bold">
+                              {preset.name}
+                            </Typography>
+                          </Box>
+                          <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.5 }}>
+                            {preset.description}
+                          </Typography>
+                          <Chip
+                            label={`${preset.size} chars, ${preset.overlap} overlap`}
+                            size="small"
+                            variant="outlined"
+                            sx={{ mt: 0.5 }}
+                          />
+                        </CardContent>
+                      </Card>
+                    </Grid>
+                  ))}
+                </Grid>
+
+                <Alert severity="info" icon={<DescriptionIcon />}>
+                  <Typography variant="body2" fontWeight="bold" gutterBottom>
+                    💡 Choosing the Right Strategy:
+                  </Typography>
+                  <Typography variant="caption" component="div">
+                    • <strong>Q&A:</strong> {chunkPresets.qa.example}<br/>
+                    • <strong>General:</strong> {chunkPresets.default.example}<br/>
+                    • <strong>Policy:</strong> {chunkPresets.policy.example}<br/>
+                    • <strong>Code:</strong> {chunkPresets.code.example}<br/>
+                    • <strong>Lists:</strong> {chunkPresets.list.example}
+                  </Typography>
+                </Alert>
+              </>
+            ) : (
+              // ADVANCED MODE - Full Control
+              <>
+                <Alert severity="warning" sx={{ mb: 2 }}>
+                  <Typography variant="caption">
+                    <strong>⚙️ Advanced Mode:</strong> Full control over chunking. Only use if you know what you're doing!
+                  </Typography>
+                </Alert>
+
+                <FormControl fullWidth sx={{ mb: 2 }}>
+                  <InputLabel>Chunk By</InputLabel>
+                  <Select
+                    value={formData.chunk_by}
+                    label="Chunk By"
+                    onChange={(e) => setFormData({ ...formData, chunk_by: e.target.value })}
+                  >
+                    <MenuItem value="size">Character Size (default)</MenuItem>
+                    <MenuItem value="lines">Lines (one per chunk)</MenuItem>
+                    <MenuItem value="paragraphs">Paragraphs (\\n\\n separator)</MenuItem>
+                    <MenuItem value="sentences">Sentences (. separator)</MenuItem>
+                  </Select>
+                </FormControl>
+
+                <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 2 }}>
+                  <TextField
+                    label="Chunk Size"
+                    value={formData.chunk_size}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      if (value === '') {
+                        setFormData({ ...formData, chunk_size: '' });
+                      } else {
+                        const parsed = parseInt(value);
+                        if (!isNaN(parsed) && parsed > 0) {
+                          setFormData({ ...formData, chunk_size: parsed });
+                        }
+                      }
+                    }}
+                    onBlur={() => {
+                      if (formData.chunk_size === '') {
+                        setFormData({ ...formData, chunk_size: 500 });
+                      }
+                    }}
+                    disabled={submitting}
+                    helperText="Characters per chunk"
+                    inputProps={{ inputMode: 'numeric' }}
+                  />
+                  <TextField
+                    label="Chunk Overlap"
+                    value={formData.chunk_overlap}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      if (value === '') {
+                        setFormData({ ...formData, chunk_overlap: '' });
+                      } else {
+                        const parsed = parseInt(value);
+                        if (!isNaN(parsed) && parsed >= 0) {
+                          setFormData({ ...formData, chunk_overlap: parsed });
+                        }
+                      }
+                    }}
+                    onBlur={() => {
+                      if (formData.chunk_overlap === '') {
+                        setFormData({ ...formData, chunk_overlap: 50 });
+                      }
+                    }}
+                    disabled={submitting}
+                    helperText="Overlap between chunks"
+                    inputProps={{ inputMode: 'numeric' }}
+                  />
+                </Box>
+
+                <TextField
+                  fullWidth
+                  label="Custom Separator"
+                  value={formData.separator}
+                  onChange={(e) => setFormData({ ...formData, separator: e.target.value })}
+                  disabled={submitting}
+                  helperText="Text separator for chunking (e.g., \\n\\n for paragraphs, \\n for lines)"
+                  sx={{ mb: 2 }}
+                />
+
+                <TextField
+                  fullWidth
+                  label="Max Chunks (optional)"
+                  type="number"
+                  value={formData.max_chunks || ''}
+                  onChange={(e) => setFormData({ ...formData, max_chunks: e.target.value ? parseInt(e.target.value) : null })}
+                  disabled={submitting}
+                  helperText="Limit total number of chunks (leave empty for no limit)"
+                />
+              </>
+            )}
+          </Box>
 
           <TextField
             margin="dense"
@@ -885,29 +1124,127 @@ const DocumentList = ({ onRefresh }) => {
             disabled={submitting}
             sx={{ mb: 2 }}
           />
-          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 2 }}>
-            <TextField
-              margin="dense"
-              label="Chunk Size"
-              type="number"
-              value={formData.chunk_size}
-              onChange={(e) =>
-                setFormData({ ...formData, chunk_size: parseInt(e.target.value) || 500 })
-              }
-              disabled={submitting}
-              helperText="Characters per chunk"
-            />
-            <TextField
-              margin="dense"
-              label="Chunk Overlap"
-              type="number"
-              value={formData.chunk_overlap}
-              onChange={(e) =>
-                setFormData({ ...formData, chunk_overlap: parseInt(e.target.value) || 50 })
-              }
-              disabled={submitting}
-              helperText="Overlap between chunks"
-            />
+          <Box sx={{ mb: 2 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+              <Typography variant="subtitle2">
+                Chunking Strategy
+              </Typography>
+              <Button
+                size="small"
+                onClick={() => setAdvancedMode(!advancedMode)}
+                sx={{ textTransform: 'none' }}
+              >
+                {advancedMode ? '← Basic' : 'Advanced →'}
+              </Button>
+            </Box>
+
+            {!advancedMode ? (
+              // BASIC MODE - Smart Presets
+              <>
+                <Grid container spacing={2} sx={{ mb: 2 }}>
+                  {Object.entries(chunkPresets).slice(0, 4).map(([key, preset]) => (
+                    <Grid item xs={12} sm={6} key={key}>
+                      <Card
+                        sx={{
+                          cursor: 'pointer',
+                          border: selectedPreset === key ? 2 : 1,
+                          borderColor: selectedPreset === key ? 'primary.main' : 'divider',
+                          bgcolor: selectedPreset === key ? 'primary.50' : 'background.paper',
+                          transition: 'all 0.2s',
+                          '&:hover': {
+                            borderColor: 'primary.main',
+                            transform: 'translateY(-2px)',
+                          },
+                        }}
+                        onClick={() => applyPreset(key)}
+                      >
+                        <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', mb: 0.5 }}>
+                            <Typography variant="body2" sx={{ mr: 0.5 }}>
+                              {preset.icon}
+                            </Typography>
+                            <Typography variant="caption" fontWeight="bold">
+                              {preset.name}
+                            </Typography>
+                          </Box>
+                          <Chip
+                            label={`${preset.size} / ${preset.overlap}`}
+                            size="small"
+                            variant="outlined"
+                          />
+                        </CardContent>
+                      </Card>
+                    </Grid>
+                  ))}
+                </Grid>
+              </>
+            ) : (
+              // ADVANCED MODE - Full Control
+              <>
+                <FormControl fullWidth size="small" sx={{ mb: 2 }}>
+                  <InputLabel>Chunk By</InputLabel>
+                  <Select
+                    value={formData.chunk_by}
+                    label="Chunk By"
+                    onChange={(e) => setFormData({ ...formData, chunk_by: e.target.value })}
+                  >
+                    <MenuItem value="size">Character Size (default)</MenuItem>
+                    <MenuItem value="lines">Lines (one per chunk)</MenuItem>
+                    <MenuItem value="paragraphs">Paragraphs</MenuItem>
+                    <MenuItem value="sentences">Sentences</MenuItem>
+                  </Select>
+                </FormControl>
+
+                <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 2 }}>
+                  <TextField
+                    size="small"
+                    label="Chunk Size"
+                    value={formData.chunk_size}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      if (value === '') {
+                        setFormData({ ...formData, chunk_size: '' });
+                      } else {
+                        const parsed = parseInt(value);
+                        if (!isNaN(parsed) && parsed > 0) {
+                          setFormData({ ...formData, chunk_size: parsed });
+                        }
+                      }
+                    }}
+                    onBlur={() => {
+                      if (formData.chunk_size === '') {
+                        setFormData({ ...formData, chunk_size: 500 });
+                      }
+                    }}
+                    disabled={submitting}
+                    inputProps={{ inputMode: 'numeric' }}
+                  />
+                  <TextField
+                    size="small"
+                    label="Chunk Overlap"
+                    value={formData.chunk_overlap}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      if (value === '') {
+                        setFormData({ ...formData, chunk_overlap: '' });
+                      } else {
+                        const parsed = parseInt(value);
+                        if (!isNaN(parsed) && parsed >= 0) {
+                          setFormData({ ...formData, chunk_overlap: parsed });
+                        }
+                      }
+                    }}
+                    onBlur={() => {
+                      if (formData.chunk_overlap === '') {
+                        setFormData({ ...formData, chunk_overlap: 50 });
+                      }
+                    }}
+                    disabled={submitting}
+                    inputProps={{ inputMode: 'numeric' }}
+                  />
+                </Box>
+              </>
+            )}
           </Box>
           <TextField
             margin="dense"
