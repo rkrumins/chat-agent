@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+chromadb
+pydantic
+python-multipart
+aiofiles
+python-dotenv
+PyPDF2
+python-docx
+openpyxl
