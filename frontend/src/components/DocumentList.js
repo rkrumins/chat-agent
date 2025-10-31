@@ -1404,7 +1404,14 @@ const DocumentList = ({ onRefresh }) => {
                         variant="outlined"
                       />
                       <Typography variant="caption" display="block" color="text.secondary">
-                        Size: {doc.metadata.chunk_size || 500}, Overlap: {doc.metadata.chunk_overlap || 50}
+                        {doc.metadata.chunking_strategy && (
+                          <>
+                            Strategy: {doc.metadata.chunking_strategy}
+                            <br />
+                          </>
+                        )}
+                        Size: {doc.metadata.chunk_size != null ? Number(doc.metadata.chunk_size) : 'N/A'}, 
+                        Overlap: {doc.metadata.chunk_overlap != null ? Number(doc.metadata.chunk_overlap) : 'N/A'}
                       </Typography>
                     </TableCell>
                     <TableCell>
@@ -2548,11 +2555,11 @@ const DocumentList = ({ onRefresh }) => {
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <Typography variant="h6">
               Chunks & Metadata
-              {selectedDocument && ` - ${selectedDocument.metadata.name}`}
+              {selectedDocument && ` - ${selectedDocument.metadata.name || selectedDocument.metadata.title || selectedDocument.metadata.document_name || 'Document'}`}
             </Typography>
             {selectedDocumentChunks && (
               <Chip 
-                label={`${selectedDocumentChunks.total} chunks`} 
+                label={`${selectedDocumentChunks.total || selectedDocumentChunks.chunks?.length || 0} chunks`} 
                 color="primary" 
                 variant="outlined"
               />

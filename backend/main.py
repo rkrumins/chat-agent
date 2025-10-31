@@ -1198,7 +1198,8 @@ async def process_document_async(
                         chunk_text=chunk,
                         document_metadata=document_metadata,
                         document_content=content,
-                        previous_chunk_text=previous_chunk
+                        previous_chunk_text=previous_chunk,
+                        total_chunks=len(chunks)  # Pass actual chunk count
                     )
                     
                     # Prepare for ChromaDB (convert lists/dicts to strings)
@@ -1389,18 +1390,78 @@ async def list_documents(
         all_results = collection.get(include=["documents", "metadatas"])
         
         documents = []
+        
+        # First pass: collect all documents
+        doc_ids_to_process = []
         for i, doc_id in enumerate(all_results["ids"]):
             metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
             
-            # Skip chunks
-            if metadata.get("is_chunk") is True:
+            # Skip chunks (handle both boolean and string)
+            is_chunk = metadata.get("is_chunk")
+            is_chunk_bool = is_chunk is True or str(is_chunk).lower() == "true"
+            if is_chunk_bool:
                 continue
             
             # Skip old versions unless requested
             if not show_all_versions and metadata.get("is_latest") is False:
                 continue
             
-            content = all_results["documents"][i] if all_results["documents"] else ""
+            doc_ids_to_process.append((doc_id, i))
+        
+        # Second pass: count chunks for each document
+        # Build a map of chunk counts by document_id
+        chunk_counts = {}
+        for i, doc_id in enumerate(all_results["ids"]):
+            metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
+            is_chunk = metadata.get("is_chunk")
+            # Handle both boolean True and string "True" cases
+            is_chunk_bool = is_chunk is True or str(is_chunk).lower() == "true"
+            if is_chunk_bool:
+                parent_id = metadata.get("parent_id") or metadata.get("document_id")
+                if parent_id:
+                    chunk_counts[parent_id] = chunk_counts.get(parent_id, 0) + 1
+        
+        # Third pass: build document list with accurate chunk counts
+        for doc_id, idx in doc_ids_to_process:
+            metadata = all_results["metadatas"][idx] if all_results["metadatas"] else {}
+            content = all_results["documents"][idx] if all_results["documents"] else ""
+            
+            # Use stored chunk_count if available, otherwise count dynamically
+            chunk_count = metadata.get("chunk_count")
+            if chunk_count is None or chunk_count == 0:
+                chunk_count = chunk_counts.get(doc_id, 0)
+            
+            # Update metadata with accurate chunk_count
+            if chunk_count > 0:
+                metadata["chunk_count"] = chunk_count
+            
+            # Ensure chunk_size and chunk_overlap are integers (ChromaDB may store as strings)
+            # Also ensure they exist - if not present, don't add defaults here (let frontend handle it)
+            if "chunk_size" in metadata and metadata["chunk_size"] is not None:
+                try:
+                    metadata["chunk_size"] = int(metadata["chunk_size"])
+                except (ValueError, TypeError):
+                    # If conversion fails, try to get from string
+                    try:
+                        metadata["chunk_size"] = int(str(metadata["chunk_size"]).strip())
+                    except (ValueError, TypeError):
+                        pass  # Keep original value if conversion fails
+            if "chunk_overlap" in metadata and metadata["chunk_overlap"] is not None:
+                try:
+                    metadata["chunk_overlap"] = int(metadata["chunk_overlap"])
+                except (ValueError, TypeError):
+                    # If conversion fails, try to get from string
+                    try:
+                        metadata["chunk_overlap"] = int(str(metadata["chunk_overlap"]).strip())
+                    except (ValueError, TypeError):
+                        pass  # Keep original value if conversion fails
+            
+            # Debug: Log if chunk_size/chunk_overlap are missing (for troubleshooting)
+            # Only log once per document to avoid spam
+            if "chunk_size" not in metadata or metadata.get("chunk_size") is None:
+                logger.debug(f"Document {doc_id} missing chunk_size in metadata")
+            if "chunk_overlap" not in metadata or metadata.get("chunk_overlap") is None:
+                logger.debug(f"Document {doc_id} missing chunk_overlap in metadata")
             
             documents.append({
                 "id": doc_id,
@@ -1480,9 +1541,14 @@ async def get_document_chunks(collection_name: str, document_id: str, skip: int 
             metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
             
             # Check if this is a chunk belonging to the requested document
-            if (metadata.get("parent_id") == document_id or 
-                metadata.get("document_id") == document_id) and \
-               metadata.get("is_chunk") is True:
+            # Check both parent_id and document_id fields, and ensure is_chunk is True
+            parent_id = metadata.get("parent_id") or metadata.get("document_id")
+            is_chunk = metadata.get("is_chunk")
+            
+            # Handle both boolean True and string "True" cases
+            is_chunk_bool = is_chunk is True or str(is_chunk).lower() == "true"
+            
+            if parent_id == document_id and is_chunk_bool:
                 
                 content = all_results["documents"][i] if all_results["documents"] else ""
                 
@@ -1493,10 +1559,14 @@ async def get_document_chunks(collection_name: str, document_id: str, skip: int 
                     if len(lines) > 1:
                         display_content = "\n\n".join(lines[1:])
                 
+                # Get chunk index and total chunks for accurate position
+                chunk_index = metadata.get("chunk_index", 0)
+                total_chunks = len(chunks) + 1  # Will be updated after we count all chunks
+                
                 chunk_data = {
                     "id": doc_id,
-                    "chunk_index": metadata.get("chunk_index", 0),
-                    "chunk_number": metadata.get("chunk_number", 0),
+                    "chunk_index": chunk_index,
+                    "chunk_number": metadata.get("chunk_number", chunk_index + 1),
                     "content": display_content,
                     "raw_content": content,  # Keep original for reference
                     "metadata": metadata,
@@ -1506,12 +1576,18 @@ async def get_document_chunks(collection_name: str, document_id: str, skip: int 
                     "topics": metadata.get("topics", ""),
                     "difficulty_level": metadata.get("difficulty_level", "Intermediate"),
                     "section_title": metadata.get("section_title", ""),
-                    "chunk_position": metadata.get("chunk_position", ""),
+                    "chunk_position": metadata.get("chunk_position", ""),  # Will be recalculated below
                 }
                 chunks.append(chunk_data)
         
         # Sort by chunk index
         chunks.sort(key=lambda x: x.get("chunk_index", 0))
+        
+        # Recalculate chunk_position with accurate total count (after we have all chunks)
+        total_chunks = len(chunks)
+        for chunk in chunks:
+            chunk_index = chunk.get("chunk_index", 0)
+            chunk["chunk_position"] = f"{chunk_index + 1} of {total_chunks}"
         
         # Apply pagination
         total = len(chunks)
