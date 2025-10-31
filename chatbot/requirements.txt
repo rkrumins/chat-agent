@@ -1,0 +1,21 @@
+# Core dependencies
+chainlit
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+
+# Vector database
+chromadb
+
+# Embeddings - specify older version for Python 3.13 compatibility
+sentence-transformers
+
+# LLM Providers
+langchain-groq
+langchain-google-genai
+langchain-openai
+
+# Additional dependencies
+python-dotenv
+
