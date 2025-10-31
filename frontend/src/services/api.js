@@ -80,6 +80,14 @@ export const documentsAPI = {
     return response.data;
   },
 
+  getChunks: async (collectionName, documentId, skip = 0, limit = 100) => {
+    const response = await api.get(
+      `/collections/${collectionName}/documents/${documentId}/chunks`,
+      { params: { skip, limit } }
+    );
+    return response.data;
+  },
+
   search: async (collectionName, query, nResults = 5) => {
     const response = await api.post(
       `/collections/${collectionName}/search`,

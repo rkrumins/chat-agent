@@ -12,7 +12,22 @@ from enum import Enum
 import logging
 import json
 import io
+import re
 from pathlib import Path
+from typing import Literal
+
+# Import production utilities
+from utils import (
+    validate_file_size, validate_content, validate_chunking_parameters,
+    validate_chunk_quality, calculate_content_hash, detect_duplicate_content,
+    sanitize_filename, estimate_processing_time, MAX_FILE_SIZE
+)
+
+# Import metadata extraction utilities
+from metadata_extractor import (
+    build_comprehensive_document_metadata,
+    build_comprehensive_chunk_metadata
+)
 
 # File parsing imports
 try:
@@ -52,6 +67,10 @@ embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
 # In-memory storage for processing status
 processing_status: Dict[str, Dict[str, Any]] = {}
 
+# Storage for content hashes (for duplicate detection)
+# In production, this should be persisted (e.g., in a database)
+content_hashes: Dict[str, List[str]] = {}  # collection_name -> list of hashes
+
 
 class ProcessingStatus(str, Enum):
     PENDING = "pending"
@@ -60,10 +79,22 @@ class ProcessingStatus(str, Enum):
     FAILED = "failed"
 
 
+class ChunkingStrategy(str, Enum):
+    """Chunking strategy options for document processing"""
+    SEMANTIC = "semantic"  # Smart semantic chunking (default, best for most cases)
+    SIZE = "size"  # Character-based chunking with size limit
+    LINES = "lines"  # Line-based chunking (one line per chunk)
+    PARAGRAPHS = "paragraphs"  # Paragraph-based chunking (paragraph separator)
+    SENTENCES = "sentences"  # Sentence-based chunking (sentence boundaries)
+    CUSTOM = "custom"  # Custom separator-based chunking
+
+
 class DocumentMetadata(BaseModel):
     name: str
     purpose: Optional[str] = ""
-    tags: Optional[str] = ""  # Changed to string (comma-separated)
+    tags: Optional[str] = ""  # Comma-separated tags
+    author: Optional[str] = None  # Document author/creator
+    source: Optional[str] = None  # Source of the document (e.g., 'confluence', 'github', 'upload')
     custom_metadata: Optional[Dict[str, Any]] = {}
 
 
@@ -71,8 +102,11 @@ class DocumentCreate(BaseModel):
     collection_name: str
     metadata: DocumentMetadata
     content: Optional[str] = ""
-    chunk_size: Optional[int] = 500
-    chunk_overlap: Optional[int] = 50
+    chunk_size: Optional[int] = 1000  # Increased default for better context
+    chunk_overlap: Optional[int] = 200  # Increased default for better continuity
+    chunking_strategy: Optional[str] = "semantic"  # Chunking strategy: semantic, size, lines, paragraphs, sentences, custom
+    chunk_separator: Optional[str] = None  # Custom separator for chunking (used with custom strategy)
+    max_chunks: Optional[int] = None  # Optional limit on total number of chunks
     create_new_version: Optional[bool] = False  # If True, create new version of existing doc
 
 
@@ -81,6 +115,9 @@ class DocumentUpdate(BaseModel):
     content: Optional[str] = None
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
+    chunking_strategy: Optional[str] = None
+    chunk_separator: Optional[str] = None
+    max_chunks: Optional[int] = None
 
 
 class VersionInfo(BaseModel):
@@ -191,23 +228,588 @@ def parse_file(filename: str, file_content: bytes) -> str:
 
 
 # Helper functions
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-    """Split text into overlapping chunks"""
-    chunks = []
-    start = 0
-    text_length = len(text)
+
+def chunk_by_lines(text: str, max_chunks: Optional[int] = None) -> List[str]:
+    """
+    Chunk text by lines (one line per chunk).
+    Useful for structured documents, code, or line-by-line data.
+    """
+    lines = text.split('\n')
+    chunks = [line.strip() for line in lines if line.strip()]
     
-    if text_length == 0:
+    if max_chunks:
+        chunks = chunks[:max_chunks]
+    
+    return chunks
+
+
+def chunk_by_paragraphs(text: str, separator: str = '\n\n', chunk_size: int = 2000, overlap: int = 0, max_chunks: Optional[int] = None) -> List[str]:
+    """
+    Chunk text by paragraphs using a separator.
+    If a paragraph exceeds chunk_size, it will be split by sentences.
+    Useful for documents with clear paragraph structure.
+    """
+    paragraphs = text.split(separator)
+    processed_chunks = []
+    
+    for para in paragraphs:
+        trimmed = para.strip()
+        if not trimmed:
+            continue
+        
+        # If paragraph exceeds chunk_size, split it by sentences
+        if len(trimmed) > chunk_size:
+            # Split paragraph into sentences
+            sentence_pattern = r'([.!?]+)\s+'
+            sentences = re.split(sentence_pattern, trimmed)
+            
+            # Reconstruct sentences
+            proper_sentences = []
+            i = 0
+            while i < len(sentences):
+                if i + 1 < len(sentences) and re.match(sentence_pattern, sentences[i+1] + ' '):
+                    proper_sentences.append(sentences[i] + sentences[i+1])
+                    i += 2
+                else:
+                    if sentences[i].strip():
+                        proper_sentences.append(sentences[i])
+                    i += 1
+            
+            # Build chunks from sentences, respecting chunk_size
+            current_chunk = []
+            current_length = 0
+            
+            for sentence in proper_sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                
+                sentence_length = len(sentence)
+                
+                if current_length + sentence_length + 1 > chunk_size and current_chunk:
+                    processed_chunks.append(' '.join(current_chunk))
+                    
+                    if overlap > 0:
+                        # Calculate overlap: keep last N sentences based on overlap size
+                        overlap_sentences = current_chunk[-max(1, len(current_chunk) * overlap // chunk_size):]
+                        current_chunk = overlap_sentences + [sentence]
+                        current_length = len(' '.join(current_chunk))
+                        
+                        # Ensure overlap + new sentence doesn't exceed chunk_size (if it does, start fresh)
+                        if current_length > chunk_size:
+                            current_chunk = [sentence]
+                            current_length = sentence_length
+                    else:
+                        current_chunk = [sentence]
+                        current_length = sentence_length
+                else:
+                    current_chunk.append(sentence)
+                    current_length += sentence_length + 1
+                
+                if max_chunks and len(processed_chunks) >= max_chunks:
+                    break
+            
+            if current_chunk and (not max_chunks or len(processed_chunks) < max_chunks):
+                processed_chunks.append(' '.join(current_chunk))
+            
+            if max_chunks and len(processed_chunks) >= max_chunks:
+                break
+        else:
+            # Paragraph fits within chunk_size, use it as-is
+            processed_chunks.append(trimmed)
+            if max_chunks and len(processed_chunks) >= max_chunks:
+                break
+    
+    chunks = processed_chunks
+    
+    # Add overlap between paragraph-based chunks (but ensure chunks don't exceed chunk_size)
+    if overlap > 0 and len(chunks) > 1:
+        overlapped_chunks = []
+        for i, chunk in enumerate(chunks):
+            overlapped = chunk
+            if i > 0:
+                # Add overlap from previous chunk
+                prev_chunk = chunks[i-1]
+                max_overlap = min(overlap, len(prev_chunk))
+                overlap_text = prev_chunk[-max_overlap:]
+                combined_length = len(overlap_text) + len(separator) + len(chunk)
+                
+                # If adding overlap would exceed chunk_size, reduce the main chunk content
+                if combined_length > chunk_size:
+                    available_space = chunk_size - len(overlap_text) - len(separator)
+                    if available_space > 0:
+                        # Truncate the main chunk to make room for overlap
+                        chunk = chunk[:available_space]
+                        overlapped = f"{overlap_text}{separator}{chunk}"
+                    else:
+                        # If there's no room even after truncation, use minimal content
+                        overlapped = f"{overlap_text}{separator}{chunk[:max(0, chunk_size - len(overlap_text) - len(separator))]}"
+                else:
+                    overlapped = f"{overlap_text}{separator}{chunk}"
+            overlapped_chunks.append(overlapped)
+        chunks = overlapped_chunks
+    
+    if max_chunks:
+        chunks = chunks[:max_chunks]
+    
+    return chunks
+
+
+def chunk_by_sentences(text: str, chunk_size: int = 1000, overlap: int = 200, max_chunks: Optional[int] = None) -> List[str]:
+    """
+    Chunk text by sentences, respecting chunk_size.
+    Useful for maintaining sentence boundaries while controlling chunk size.
+    """
+    # Split by sentence endings
+    sentence_pattern = r'([.!?]+)\s+'
+    sentences = re.split(sentence_pattern, text)
+    
+    # Reconstruct sentences
+    proper_sentences = []
+    i = 0
+    while i < len(sentences):
+        if i + 1 < len(sentences) and re.match(sentence_pattern, sentences[i+1] + ' '):
+            proper_sentences.append(sentences[i] + sentences[i+1])
+            i += 2
+        else:
+            if sentences[i].strip():
+                proper_sentences.append(sentences[i])
+            i += 1
+    
+    # Build chunks from sentences
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for sentence in proper_sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        
+        sentence_length = len(sentence)
+        
+        if current_length + sentence_length + 1 > chunk_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            
+            # Add overlap if specified
+            if overlap > 0:
+                # Calculate overlap: keep last N sentences based on overlap size
+                overlap_sentences = current_chunk[-max(1, len(current_chunk) * overlap // chunk_size):]
+                current_chunk = overlap_sentences + [sentence]
+                current_length = len(' '.join(current_chunk))
+                
+                # Ensure overlap + new sentence doesn't exceed chunk_size (if it does, start fresh)
+                if current_length > chunk_size:
+                    current_chunk = [sentence]
+                    current_length = sentence_length
+            else:
+                current_chunk = [sentence]
+                current_length = sentence_length
+        else:
+            current_chunk.append(sentence)
+            current_length += sentence_length + 1
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    if max_chunks:
+        chunks = chunks[:max_chunks]
+    
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def chunk_by_size(text: str, chunk_size: int = 1000, overlap: int = 200, max_chunks: Optional[int] = None) -> List[str]:
+    """
+    Chunk text by character size with word boundaries.
+    Simple character-based chunking that respects word boundaries.
+    """
+    if not text or not text.strip():
         return []
     
-    while start < text_length:
-        end = start + chunk_size
-        chunk = text[start:end]
-        if chunk.strip():  # Only add non-empty chunks
-            chunks.append(chunk)
-        start = end - overlap
+    if len(text) <= chunk_size:
+        return [text.strip()]
     
-    return chunks if chunks else [text]  # Return full text if no chunks
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        word_with_space = word + ' '
+        word_length = len(word_with_space)
+        
+        if current_length + word_length > chunk_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            
+            # Add overlap
+            if overlap > 0:
+                # Calculate overlap: keep last N words based on overlap size
+                overlap_words = current_chunk[-max(1, len(current_chunk) * overlap // chunk_size):]
+                current_chunk = overlap_words + [word]
+                current_length = len(' '.join(current_chunk))
+                
+                # Ensure overlap + new word doesn't exceed chunk_size (if it does, start fresh)
+                if current_length > chunk_size:
+                    current_chunk = [word]
+                    current_length = word_length
+            else:
+                current_chunk = [word]
+                current_length = word_length
+        else:
+            current_chunk.append(word)
+            current_length += word_length
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    if max_chunks:
+        chunks = chunks[:max_chunks]
+    
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def chunk_by_custom_separator(text: str, separator: str, chunk_size: int = 1000, overlap: int = 0, max_chunks: Optional[int] = None) -> List[str]:
+    """
+    Chunk text using a custom separator.
+    If chunks exceed chunk_size, they will be split further.
+    Useful for structured data with known separators.
+    """
+    chunks = text.split(separator)
+    chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
+    
+    # If chunks exceed chunk_size, split them further
+    if chunk_size:
+        sized_chunks = []
+        for chunk in chunks:
+            if len(chunk) > chunk_size:
+                # Split large chunks by words
+                words = chunk.split()
+                current_chunk = []
+                current_length = 0
+                
+                for word in words:
+                    word_with_space = word + ' '
+                    word_length = len(word_with_space)
+                    
+                    if current_length + word_length > chunk_size and current_chunk:
+                        sized_chunks.append(' '.join(current_chunk))
+                        
+                        if overlap > 0:
+                            overlap_words = current_chunk[-max(1, len(current_chunk) * overlap // chunk_size):]
+                            current_chunk = overlap_words + [word]
+                            current_length = len(' '.join(current_chunk))
+                            
+                            # Ensure overlap + new word doesn't exceed chunk_size (if it does, start fresh)
+                            if current_length > chunk_size:
+                                current_chunk = [word]
+                                current_length = word_length
+                        else:
+                            current_chunk = [word]
+                            current_length = word_length
+                    else:
+                        current_chunk.append(word)
+                        current_length += word_length
+                    
+                    if max_chunks and len(sized_chunks) >= max_chunks:
+                        break
+                
+                if current_chunk and (not max_chunks or len(sized_chunks) < max_chunks):
+                    sized_chunks.append(' '.join(current_chunk))
+                
+                if max_chunks and len(sized_chunks) >= max_chunks:
+                    break
+            else:
+                sized_chunks.append(chunk)
+                if max_chunks and len(sized_chunks) >= max_chunks:
+                    break
+        chunks = sized_chunks
+    
+    # Add overlap if specified (but ensure chunks don't exceed chunk_size)
+    if overlap > 0 and len(chunks) > 1:
+        overlapped_chunks = []
+        for i, chunk in enumerate(chunks):
+            overlapped = chunk
+            if i > 0:
+                prev_chunk = chunks[i-1]
+                max_overlap = min(overlap, len(prev_chunk))
+                overlap_text = prev_chunk[-max_overlap:]
+                
+                if chunk_size:
+                    combined_length = len(overlap_text) + len(separator) + len(chunk)
+                    if combined_length > chunk_size:
+                        available_space = chunk_size - len(overlap_text) - len(separator)
+                        if available_space > 0:
+                            chunk = chunk[:available_space]
+                            overlapped = f"{overlap_text}{separator}{chunk}"
+                        else:
+                            overlapped = f"{overlap_text}{separator}{chunk[:max(0, chunk_size - len(overlap_text) - len(separator))]}"
+                    else:
+                        overlapped = f"{overlap_text}{separator}{chunk}"
+                else:
+                    overlapped = f"{overlap_text}{separator}{chunk}"
+            overlapped_chunks.append(overlapped)
+        chunks = overlapped_chunks
+    
+    if max_chunks:
+        chunks = chunks[:max_chunks]
+    
+    return chunks
+
+
+def chunk_text(
+    text: str, 
+    chunk_size: int = 1000, 
+    overlap: int = 200,
+    strategy: str = "semantic",
+    separator: Optional[str] = None,
+    max_chunks: Optional[int] = None
+) -> List[str]:
+    """
+    Advanced chunking function with multiple strategies.
+    Supports semantic, size-based, line-based, paragraph-based, sentence-based, and custom separator chunking.
+    
+    Args:
+        text: Text to chunk
+        chunk_size: Target chunk size in characters (for size, sentences, semantic strategies)
+        overlap: Overlap size in characters or elements (default 200)
+        strategy: Chunking strategy - "semantic", "size", "lines", "paragraphs", "sentences", "custom"
+        separator: Custom separator for "custom" strategy (or override for paragraphs)
+        max_chunks: Optional limit on total number of chunks
+    
+    Returns:
+        List of text chunks based on the specified strategy
+    """
+    if not text or not text.strip():
+        return []
+    
+    # Normalize strategy name
+    strategy = strategy.lower() if strategy else "semantic"
+    
+    # Route to appropriate chunking strategy
+    if strategy == "lines":
+        return chunk_by_lines(text, max_chunks)
+    
+    elif strategy == "paragraphs":
+        sep = separator if separator else '\n\n'
+        return chunk_by_paragraphs(text, separator=sep, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    
+    elif strategy == "sentences":
+        return chunk_by_sentences(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    
+    elif strategy == "size":
+        return chunk_by_size(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    
+    elif strategy == "custom":
+        if not separator:
+            # Fallback to paragraphs if no separator provided
+            separator = '\n\n'
+        return chunk_by_custom_separator(text, separator=separator, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    
+    else:
+        # Default: semantic chunking (smart chunking with Mix-of-Granularity)
+        return chunk_text_semantic(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+
+
+def chunk_text_semantic(text: str, chunk_size: int = 1000, overlap: int = 200, max_chunks: Optional[int] = None) -> List[str]:
+    """
+    Advanced semantic chunking with Mix-of-Granularity approach:
+    Split text into overlapping chunks using sentence and paragraph boundaries for better context preservation.
+    This follows RAG best practices for semantic coherence and is optimized for large-scale document processing.
+    
+    Mix-of-Granularity (MoG) features:
+    - Dynamic chunk sizing based on content structure (paragraphs, sentences, sections)
+    - Respects paragraph boundaries for semantic coherence
+    - Uses sentence boundaries to avoid cutting mid-thought
+    - Intelligent overlap that preserves context across chunks
+    - Handles various text structures (paragraphs, lists, code blocks, definitions)
+    - Optimized for both large books (100s of pages) and small definitions (millions of entries)
+    
+    For large-scale ingestion (100s of books, millions of definitions):
+    - Smaller chunks (500-1000 chars) for definitions: better precision
+    - Larger chunks (1000-2000 chars) for books: better context
+    - Adaptive sizing based on document type detected
+    
+    Args:
+        text: Text to chunk
+        chunk_size: Target chunk size in characters (default 1000 for better context)
+                   For definitions, use 500-800. For books, use 1000-2000.
+        overlap: Overlap size in characters (default 200 for context continuity)
+                Typically 10-20% of chunk_size for optimal results
+        max_chunks: Optional limit on total number of chunks
+    
+    Returns:
+        List of text chunks with semantic coherence preserved
+    """
+    if not text or not text.strip():
+        return []
+    
+    # If text is smaller than chunk_size, return as single chunk
+    if len(text) <= chunk_size:
+        result = [text.strip()]
+        if max_chunks:
+            result = result[:max_chunks]
+        return result
+    
+    chunks = []
+    
+    # Split text into sentences (handles multiple sentence endings)
+    # Pattern matches: . ! ? followed by space or newline
+    sentence_pattern = r'([.!?]+)\s+'
+    sentences = re.split(sentence_pattern, text)
+    
+    # Reconstruct sentences (split includes delimiters)
+    proper_sentences = []
+    i = 0
+    while i < len(sentences):
+        if i + 1 < len(sentences) and re.match(sentence_pattern, sentences[i+1] + ' '):
+            proper_sentences.append(sentences[i] + sentences[i+1])
+            i += 2
+        else:
+            if sentences[i].strip():
+                proper_sentences.append(sentences[i])
+            i += 1
+    
+    # Fallback: if sentence splitting fails or text has no sentence markers,
+    # split by paragraph breaks or fall back to character-based with word boundaries
+    if len(proper_sentences) == 0 or len(proper_sentences[0]) > chunk_size:
+        # Split by paragraphs first
+        paragraphs = text.split('\n\n')
+        proper_sentences = []
+        for para in paragraphs:
+            if len(para.strip()) > chunk_size:
+                # If paragraph is too long, split by sentences within it
+                para_sentences = re.split(r'([.!?]+)\s+', para)
+                j = 0
+                while j < len(para_sentences):
+                    if j + 1 < len(para_sentences) and re.match(r'([.!?]+)', para_sentences[j+1]):
+                        proper_sentences.append(para_sentences[j] + para_sentences[j+1])
+                        j += 2
+                    else:
+                        if para_sentences[j].strip():
+                            proper_sentences.append(para_sentences[j])
+                        j += 1
+            else:
+                if para.strip():
+                    proper_sentences.append(para)
+    
+    # If still no good splits, use word boundaries
+    if len(proper_sentences) == 0 or (len(proper_sentences) == 1 and len(proper_sentences[0]) > chunk_size * 2):
+        # Split by words and respect chunk boundaries
+        words = text.split()
+        current_chunk = []
+        current_length = 0
+        
+        for word in words:
+            word_with_space = word + ' '
+            word_length = len(word_with_space)
+            
+            if current_length + word_length > chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                # Start overlap: take last N words for overlap
+                if overlap > 0:
+                    overlap_words = current_chunk[-max(1, len(current_chunk) * overlap // chunk_size):]
+                    current_chunk = overlap_words + [word]
+                    current_length = len(' '.join(current_chunk))
+                    
+                    # Ensure overlap + new word doesn't exceed chunk_size (if it does, start fresh)
+                    if current_length > chunk_size:
+                        current_chunk = [word]
+                        current_length = word_length
+                else:
+                    current_chunk = [word]
+                    current_length = word_length
+            else:
+                current_chunk.append(word)
+                current_length += word_length
+            
+            # Check max_chunks limit
+            if max_chunks and len(chunks) >= max_chunks:
+                break
+        
+        if current_chunk and (not max_chunks or len(chunks) < max_chunks):
+            chunks.append(' '.join(current_chunk))
+        
+        result = [chunk.strip() for chunk in chunks if chunk.strip()]
+        if max_chunks:
+            result = result[:max_chunks]
+        return result
+    
+    # Build chunks from sentences
+    current_chunk = []
+    current_length = 0
+    
+    for sentence in proper_sentences:
+        # Check max_chunks limit
+        if max_chunks and len(chunks) >= max_chunks:
+            break
+        
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        sentence_length = len(sentence)
+        
+        # If single sentence exceeds chunk size, add it anyway and split later if needed
+        if sentence_length > chunk_size:
+            # Save current chunk if it has content
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+            
+            # Split the long sentence by word boundaries
+            words = sentence.split()
+            temp_chunk = []
+            temp_length = 0
+            
+            for word in words:
+                word_with_space = word + ' '
+                if temp_length + len(word_with_space) > chunk_size and temp_chunk:
+                    chunks.append(' '.join(temp_chunk))
+                    if max_chunks and len(chunks) >= max_chunks:
+                        break
+                    temp_chunk = [word]
+                    temp_length = len(word)
+                else:
+                    temp_chunk.append(word)
+                    temp_length += len(word_with_space)
+            
+            if temp_chunk:
+                current_chunk = temp_chunk
+                current_length = temp_length
+            else:
+                current_chunk = []
+                current_length = 0
+        else:
+            # Check if adding this sentence would exceed chunk size
+            if current_length + sentence_length + 1 > chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                if max_chunks and len(chunks) >= max_chunks:
+                    break
+                
+                # Create overlap: include last few sentences from current chunk
+                if overlap > 0:
+                    overlap_sentences = current_chunk[-max(1, len(current_chunk) * overlap // chunk_size):]
+                    current_chunk = overlap_sentences + [sentence]
+                    current_length = len(' '.join(current_chunk))
+                    
+                    # Ensure overlap + new sentence doesn't exceed chunk_size (if it does, start fresh)
+                    if current_length > chunk_size:
+                        current_chunk = [sentence]
+                        current_length = sentence_length
+                else:
+                    current_chunk = [sentence]
+                    current_length = sentence_length
+            else:
+                current_chunk.append(sentence)
+                current_length += sentence_length + 1  # +1 for space
+    
+    # Add final chunk
+    if current_chunk and (not max_chunks or len(chunks) < max_chunks):
+        chunks.append(' '.join(current_chunk))
+    
+    result = [chunk.strip() for chunk in chunks if chunk.strip()]
+    if max_chunks:
+        result = result[:max_chunks]
+    return result
 
 
 def prepare_metadata_for_chroma(metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -246,6 +848,115 @@ def get_next_version_number(collection, document_name: str) -> int:
         return 1
 
 
+def detect_document_type(content: str, metadata: Dict[str, Any]) -> str:
+    """
+    Detect document type based on content and metadata.
+    Returns: 'book', 'definition', 'article', 'blog_post', 'poem', or 'unknown'
+    """
+    doc_name = metadata.get("name", "").lower()
+    purpose = metadata.get("purpose", "").lower()
+    tags = metadata.get("tags", "").lower()
+    
+    # Check metadata first
+    if any(word in doc_name or word in purpose or word in tags 
+           for word in ["definition", "definitions", "glossary", "dictionary"]):
+        return "definition"
+    if any(word in doc_name or word in purpose or word in tags 
+           for word in ["book", "textbook", "guide", "manual", "tome"]):
+        return "book"
+    if any(word in doc_name or word in purpose or word in tags 
+           for word in ["article", "paper", "essay"]):
+        return "article"
+    if any(word in doc_name or word in purpose or word in tags 
+           for word in ["blog", "post", "entry"]):
+        return "blog_post"
+    if any(word in doc_name or word in purpose or word in tags 
+           for word in ["poem", "poetry", "verse", "sonnet"]):
+        return "poem"
+    
+    # Content-based detection
+    content_lower = content[:2000].lower()  # Check first 2000 chars
+    
+    # Poem indicators: line breaks, rhyme patterns, verse structure
+    lines = content.split('\n')
+    avg_line_length = sum(len(line.strip()) for line in lines[:20]) / max(1, min(20, len(lines)))
+    if avg_line_length < 50 and len(lines) > 5:
+        if any(word in content_lower for word in ["verse", "stanza", "rhyme", "poem"]):
+            return "poem"
+    
+    # Definition indicators: term-definition patterns
+    definition_patterns = [
+        r'^[A-Z][a-z]+:\s*[A-Z]',  # Term: Definition
+        r'^[A-Z][a-z]+\s+—\s+',     # Term — Definition
+        r'^[A-Z][a-z]+\s+=\s+',     # Term = Definition
+    ]
+    definition_count = sum(1 for line in lines[:50] 
+                          if any(re.match(pattern, line.strip()) for pattern in definition_patterns))
+    if definition_count > 5:
+        return "definition"
+    
+    # Article indicators: structured sections, citations
+    if any(word in content_lower for word in ["abstract", "introduction", "conclusion", "references", "citation"]):
+        return "article"
+    
+    # Blog post indicators: casual tone, dates, tags
+    if any(word in content_lower for word in ["posted on", "published", "tags:", "#", "read more"]):
+        return "blog_post"
+    
+    # Book indicators: chapters, table of contents, comprehensive structure
+    if any(word in content_lower for word in ["chapter", "table of contents", "preface", "appendix"]):
+        return "book"
+    
+    # Default: if it's substantial content (>5000 chars), likely a book
+    if len(content) > 5000:
+        return "book"
+    
+    return "unknown"
+
+
+def create_contextual_chunk(chunk_text: str, document_name: str, document_type: str, 
+                            chunk_number: int, total_chunks: int, metadata: Dict[str, Any]) -> str:
+    """
+    Create contextual chunk by prepending document type, name, and context.
+    This improves retrieval accuracy by ensuring embeddings include document type information.
+    """
+    # Create contextual prefix
+    context_parts = []
+    
+    # Document type indicator (critical for filtering)
+    doc_type_map = {
+        "book": "BOOK",
+        "definition": "DEFINITION",
+        "article": "ARTICLE", 
+        "blog_post": "BLOG_POST",
+        "poem": "POEM",
+        "unknown": "DOCUMENT"
+    }
+    type_label = doc_type_map.get(document_type, "DOCUMENT")
+    context_parts.append(f"[DOCUMENT_TYPE: {type_label}]")
+    
+    # Document name
+    context_parts.append(f"[DOCUMENT_NAME: {document_name}]")
+    
+    # Chunk position (for context)
+    if total_chunks > 1:
+        context_parts.append(f"[CHUNK: {chunk_number} of {total_chunks}]")
+    
+    # Purpose/tags if available (helpful for retrieval)
+    purpose = metadata.get("purpose", "")
+    tags = metadata.get("tags", "")
+    if purpose:
+        context_parts.append(f"[PURPOSE: {purpose[:100]}]")  # Limit length
+    if tags:
+        context_parts.append(f"[TAGS: {tags[:100]}]")
+    
+    # Build contextual chunk
+    context_header = " ".join(context_parts)
+    contextual_chunk = f"{context_header}\n\n{chunk_text}"
+    
+    return contextual_chunk
+
+
 def mark_previous_versions_as_old(collection, document_name: str):
     """Mark all previous versions of a document as not latest"""
     try:
@@ -273,87 +984,290 @@ async def process_document_async(
     metadata: Dict[str, Any],
     chunk_size: int = 500,
     chunk_overlap: int = 50,
-    version: int = 1
+    chunking_strategy: str = "semantic",
+    chunk_separator: Optional[str] = None,
+    max_chunks: Optional[int] = None,
+    version: int = 1,
+    max_retries: int = 3
 ):
-    """Process document asynchronously with status updates"""
-    try:
-        processing_status[task_id]["status"] = ProcessingStatus.PROCESSING
-        processing_status[task_id]["message"] = "Chunking document..."
-        processing_status[task_id]["progress"] = 20
-        processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
-        
-        # Simulate chunking
-        await asyncio.sleep(0.5)
-        chunks = chunk_text(content, chunk_size, chunk_overlap)
-        
-        processing_status[task_id]["message"] = f"Processing {len(chunks)} chunks..."
-        processing_status[task_id]["progress"] = 50
-        processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
-        
-        # Get or create collection with embedding function
-        collection = chroma_client.get_or_create_collection(
-            name=collection_name,
-            metadata={"description": metadata.get("description", "")},
-            embedding_function=embedding_function
-        )
-        
-        # Simulate embedding generation
-        await asyncio.sleep(0.5)
-        
-        processing_status[task_id]["message"] = "Storing in vector database..."
-        processing_status[task_id]["progress"] = 80
-        processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
-        
-        # Prepare metadata for ChromaDB (convert lists to strings)
-        chroma_metadata = prepare_metadata_for_chroma(metadata)
-        chroma_metadata["chunk_size"] = chunk_size
-        chroma_metadata["chunk_overlap"] = chunk_overlap
-        chroma_metadata["version"] = version
-        chroma_metadata["is_latest"] = True
-        
-        # Store chunks
-        if len(chunks) > 1:
-            chunk_ids = [f"{document_id}_chunk_{i}" for i in range(len(chunks))]
-            chunk_metadata = [{
-                **chroma_metadata,
-                "chunk_index": i,
-                "parent_id": document_id,
-                "is_chunk": True
-            } for i in range(len(chunks))]
+    """Process document asynchronously with status updates, validation, and error recovery"""
+    retry_count = 0
+    last_error = None
+    
+    while retry_count <= max_retries:
+        try:
+            # Update status
+            processing_status[task_id]["status"] = ProcessingStatus.PROCESSING
+            processing_status[task_id]["message"] = "Validating document content..." if retry_count == 0 else f"Retrying (attempt {retry_count + 1}/{max_retries + 1})..."
+            processing_status[task_id]["progress"] = 5
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            # Add chunks to collection
-            collection.add(
-                documents=chunks,
-                metadatas=chunk_metadata,
-                ids=chunk_ids
+            # Step 1: Validate content
+            is_valid, error_msg, sanitized_content = validate_content(content)
+            if not is_valid:
+                raise ValueError(f"Content validation failed: {error_msg}")
+            
+            content = sanitized_content  # Use sanitized content
+            
+            # Step 2: Validate chunking parameters
+            is_valid, error_msg = validate_chunking_parameters(
+                chunk_size, chunk_overlap, chunking_strategy, max_chunks
             )
+            if not is_valid:
+                raise ValueError(f"Chunking parameter validation failed: {error_msg}")
+            
+            # Step 3: Check for duplicates (optional - can be disabled in metadata)
+            check_duplicates = metadata.get("check_duplicates", True)
+            if check_duplicates:
+                processing_status[task_id]["message"] = "Checking for duplicates..."
+                processing_status[task_id]["progress"] = 10
+                processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+                
+                existing_hashes = content_hashes.get(collection_name, [])
+                is_duplicate, hash_value = detect_duplicate_content(content, existing_hashes)
+                
+                if is_duplicate:
+                    logger.warning(f"Duplicate content detected for document {document_id} (hash: {hash_value[:16]}...)")
+                    # Allow duplicates but log them - in production you might want to skip or warn
+                    processing_status[task_id]["message"] = "Warning: Duplicate content detected, proceeding anyway..."
+                else:
+                    # Store hash for future duplicate detection
+                    if collection_name not in content_hashes:
+                        content_hashes[collection_name] = []
+                    content_hashes[collection_name].append(hash_value)
+            
+            # Step 4: Estimate processing time
+            processing_status[task_id]["message"] = "Estimating processing time..."
+            processing_status[task_id]["progress"] = 15
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            
+            time_estimate = estimate_processing_time(len(content), chunk_size)
+            processing_status[task_id]["estimated_time"] = time_estimate.get("estimated_total_time", 0)
+            processing_status[task_id]["estimated_chunks"] = time_estimate.get("estimated_chunks", 0)
+            
+            # Step 5: Chunk document
+            processing_status[task_id]["message"] = "Chunking document..."
+            processing_status[task_id]["progress"] = 20
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Use chunking strategy from metadata or parameters
+            strategy = metadata.get("chunking_strategy") or chunking_strategy or "semantic"
+            separator = metadata.get("chunk_separator") or chunk_separator
+            max_chunks_param = metadata.get("max_chunks") or max_chunks
+            
+            chunks = chunk_text(
+                content, 
+                chunk_size=chunk_size, 
+                overlap=chunk_overlap,
+                strategy=strategy,
+                separator=separator,
+                max_chunks=max_chunks_param
+            )
+            
+            # Step 6: Validate chunk quality
+            processing_status[task_id]["message"] = "Validating chunk quality..."
+            processing_status[task_id]["progress"] = 40
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            
+            valid_chunks, quality_metrics = validate_chunk_quality(chunks)
+            
+            # Store quality metrics in processing status
+            processing_status[task_id]["quality_metrics"] = quality_metrics
+            
+            # Check if we have any valid chunks
+            if len(valid_chunks) == 0:
+                raise ValueError("No valid chunks generated after quality validation. " + 
+                               "; ".join(quality_metrics.get("issues", ["Unknown error"])))
+            
+            # Warn if many chunks were filtered
+            if quality_metrics["filtered_chunks"] > 0:
+                logger.warning(f"Filtered {quality_metrics['filtered_chunks']} invalid chunks. "
+                             f"Valid chunks: {quality_metrics['valid_chunks']}/{quality_metrics['total_chunks']}")
+            
+            chunks = valid_chunks  # Use validated chunks
+            
+            processing_status[task_id]["message"] = f"Processing {len(chunks)} validated chunks..."
+            processing_status[task_id]["progress"] = 50
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
         
-        # Store full document metadata
-        full_doc_metadata = {
-            **chroma_metadata,
-            "is_chunk": False,
-            "chunk_count": len(chunks),
-            "updated_at": datetime.utcnow().isoformat()
-        }
+            # Step 7: Get or create collection
+            processing_status[task_id]["message"] = "Preparing vector database collection..."
+            processing_status[task_id]["progress"] = 55
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            
+            collection = chroma_client.get_or_create_collection(
+                name=collection_name,
+                metadata={"description": metadata.get("description", "")},
+                embedding_function=embedding_function
+            )
+            
+            # Step 8: Detect document type
+            processing_status[task_id]["message"] = "Detecting document type and creating contextual chunks..."
+            processing_status[task_id]["progress"] = 60
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
         
-        collection.add(
-            documents=[content],
-            metadatas=[full_doc_metadata],
-            ids=[document_id]
-        )
+            # Detect document type
+            document_type = detect_document_type(content, metadata)
+            logger.info(f"Detected document type: {document_type} for document: {metadata.get('name', 'Unknown')}")
+            
+            # Adaptive chunk sizing based on document type (Mix-of-Granularity approach)
+            # Only applies to semantic strategy - user-specified strategies use exact parameters
+            if strategy.lower() == "semantic":
+                # This optimizes for large-scale processing: smaller chunks for definitions, larger for books
+                adaptive_chunk_size = chunk_size
+                adaptive_overlap = chunk_overlap
+                
+                if document_type == "definition":
+                    # Definitions benefit from smaller, precise chunks for better retrieval accuracy
+                    adaptive_chunk_size = min(800, max(500, chunk_size))
+                    adaptive_overlap = min(150, max(50, chunk_overlap))
+                elif document_type == "book":
+                    # Books benefit from larger chunks to preserve context and reduce chunk count
+                    adaptive_chunk_size = max(1000, min(2000, chunk_size))
+                    adaptive_overlap = max(200, min(400, chunk_overlap))
+                elif document_type == "article":
+                    # Articles use medium chunks
+                    adaptive_chunk_size = max(800, min(1500, chunk_size))
+                    adaptive_overlap = max(150, min(300, chunk_overlap))
+                
+                # Use adaptive sizes for chunking
+                if adaptive_chunk_size != chunk_size or adaptive_overlap != chunk_overlap:
+                    logger.info(f"Adaptive chunking (semantic): {document_type} -> size={adaptive_chunk_size}, overlap={adaptive_overlap}")
+                    chunk_size = adaptive_chunk_size
+                    chunk_overlap = adaptive_overlap
         
-        processing_status[task_id]["status"] = ProcessingStatus.COMPLETED
-        processing_status[task_id]["message"] = "Document processed successfully"
-        processing_status[task_id]["progress"] = 100
-        processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            # Step 9: Prepare comprehensive metadata for ChromaDB
+            processing_status[task_id]["message"] = "Preparing comprehensive metadata..."
+            processing_status[task_id]["progress"] = 70
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Add chunking parameters to metadata for document
+            metadata["chunk_size"] = chunk_size
+            metadata["chunk_overlap"] = chunk_overlap
+            metadata["chunking_strategy"] = strategy
+            metadata["chunk_separator"] = separator
+            metadata["max_chunks"] = max_chunks_param
+            metadata["chunk_count"] = len(chunks)
+            metadata["quality_metrics"] = quality_metrics
+            
+            # Build comprehensive document metadata following RAG best practices
+            document_metadata = build_comprehensive_document_metadata(
+                document_id=document_id,
+                name=metadata.get("name", "Unknown"),
+                metadata=metadata,
+                collection_name=collection_name,
+                document_type=document_type,
+                content=content,
+                version=version
+            )
+            
+            # Prepare for ChromaDB (convert lists/dicts to strings)
+            chroma_metadata = prepare_metadata_for_chroma(document_metadata)
+            
+            # Step 10: Store chunks in vector database
+            processing_status[task_id]["message"] = "Storing in vector database with contextual chunks..."
+            processing_status[task_id]["progress"] = 80
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
         
-        logger.info(f"Document {document_id} processed successfully")
-        
-    except Exception as e:
-        logger.error(f"Error processing document {document_id}: {str(e)}")
-        processing_status[task_id]["status"] = ProcessingStatus.FAILED
-        processing_status[task_id]["message"] = f"Error: {str(e)}"
-        processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            # Store chunks with enhanced metadata and contextual prefixes
+            # Always store chunks, even if there's only one, for consistency
+            if len(chunks) >= 1:
+                chunk_ids = [f"{document_id}_chunk_{i}" for i in range(len(chunks))]
+                contextual_chunks = []
+                chunk_metadata_list = []
+                
+                document_name = metadata.get("name", "Unknown")
+                
+                for i, chunk in enumerate(chunks):
+                    # Create contextual chunk with document type and metadata prepended
+                    contextual_chunk = create_contextual_chunk(
+                        chunk_text=chunk,
+                        document_name=document_name,
+                        document_type=document_type,
+                        chunk_number=i + 1,
+                        total_chunks=len(chunks),
+                        metadata=metadata
+                    )
+                    contextual_chunks.append(contextual_chunk)
+                    
+                    # Build comprehensive chunk metadata following RAG best practices
+                    previous_chunk = chunks[i - 1] if i > 0 else None
+                    chunk_meta = build_comprehensive_chunk_metadata(
+                        chunk_id=chunk_ids[i],
+                        chunk_index=i,
+                        chunk_text=chunk,
+                        document_metadata=document_metadata,
+                        document_content=content,
+                        previous_chunk_text=previous_chunk
+                    )
+                    
+                    # Prepare for ChromaDB (convert lists/dicts to strings)
+                    chunk_meta_processed = prepare_metadata_for_chroma(chunk_meta)
+                    chunk_metadata_list.append(chunk_meta_processed)
+                
+                # Add contextual chunks to collection (these include document type in the text)
+                collection.add(
+                    documents=contextual_chunks,  # Use contextual chunks, not raw chunks
+                    metadatas=chunk_metadata_list,  # Enhanced metadata with topics, content type, etc.
+                    ids=chunk_ids
+                )
+                
+                logger.info(f"Stored {len(contextual_chunks)} contextual chunks for document type: {document_type}")
+            
+            # Step 11: Store full document
+            processing_status[task_id]["message"] = "Storing document with comprehensive metadata..."
+            processing_status[task_id]["progress"] = 90
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Update timestamp
+            chroma_metadata["updated_at"] = datetime.utcnow().isoformat()
+            chroma_metadata["is_chunk"] = False
+            
+            # Full document metadata is already comprehensive from build_comprehensive_document_metadata
+            full_doc_metadata = chroma_metadata
+            
+            collection.add(
+                documents=[content],
+                metadatas=[full_doc_metadata],
+                ids=[document_id]
+            )
+            
+            # Step 12: Success!
+            processing_status[task_id]["status"] = ProcessingStatus.COMPLETED
+            processing_status[task_id]["message"] = f"Document processed successfully. {len(chunks)} chunks stored."
+            processing_status[task_id]["progress"] = 100
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            processing_status[task_id]["chunk_count"] = len(chunks)
+            
+            logger.info(f"Document {document_id} processed successfully with {len(chunks)} chunks")
+            break  # Success - exit retry loop
+            
+        except ValueError as e:
+            # Validation errors should not be retried
+            logger.error(f"Validation error processing document {document_id}: {str(e)}")
+            processing_status[task_id]["status"] = ProcessingStatus.FAILED
+            processing_status[task_id]["message"] = f"Validation error: {str(e)}"
+            processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+            break  # Don't retry validation errors
+            
+        except Exception as e:
+            last_error = str(e)
+            retry_count += 1
+            
+            if retry_count <= max_retries:
+                # Exponential backoff for retries
+                wait_time = min(2 ** retry_count, 30)  # Max 30 seconds
+                logger.warning(f"Error processing document {document_id} (attempt {retry_count}/{max_retries + 1}): {str(e)}. Retrying in {wait_time}s...")
+                processing_status[task_id]["message"] = f"Error occurred, retrying in {wait_time}s... (attempt {retry_count}/{max_retries + 1})"
+                processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+                await asyncio.sleep(wait_time)
+            else:
+                # Max retries reached
+                logger.error(f"Error processing document {document_id} after {max_retries + 1} attempts: {last_error}")
+                processing_status[task_id]["status"] = ProcessingStatus.FAILED
+                processing_status[task_id]["message"] = f"Failed after {max_retries + 1} attempts: {last_error}"
+                processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+                processing_status[task_id]["error"] = last_error
 
 
 # API Endpoints
@@ -369,7 +1283,24 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    """Health check endpoint for monitoring"""
+    try:
+        # Check ChromaDB connection
+        collections = chroma_client.list_collections()
+        
+        return {
+            "status": "healthy",
+            "chromadb": "connected",
+            "collections_count": len(collections),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
 
 # Collection endpoints
@@ -532,16 +1463,98 @@ async def get_document(collection_name: str, document_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/collections/{collection_name}/documents/{document_id}/chunks")
+async def get_document_chunks(collection_name: str, document_id: str, skip: int = 0, limit: int = 100):
+    """Get all chunks for a specific document with metadata"""
+    try:
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
+        
+        # Get all documents to find chunks (ids are returned by default)
+        all_results = collection.get(include=["documents", "metadatas"])
+        
+        chunks = []
+        for i, doc_id in enumerate(all_results["ids"]):
+            metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
+            
+            # Check if this is a chunk belonging to the requested document
+            if (metadata.get("parent_id") == document_id or 
+                metadata.get("document_id") == document_id) and \
+               metadata.get("is_chunk") is True:
+                
+                content = all_results["documents"][i] if all_results["documents"] else ""
+                
+                # Clean up contextual prefixes for display
+                display_content = content
+                if "[DOCUMENT_TYPE:" in display_content:
+                    lines = display_content.split("\n\n")
+                    if len(lines) > 1:
+                        display_content = "\n\n".join(lines[1:])
+                
+                chunk_data = {
+                    "id": doc_id,
+                    "chunk_index": metadata.get("chunk_index", 0),
+                    "chunk_number": metadata.get("chunk_number", 0),
+                    "content": display_content,
+                    "raw_content": content,  # Keep original for reference
+                    "metadata": metadata,
+                    "length": len(content),
+                    "word_count": metadata.get("word_count", len(content.split())),
+                    "content_type": metadata.get("content_type", "paragraph"),
+                    "topics": metadata.get("topics", ""),
+                    "difficulty_level": metadata.get("difficulty_level", "Intermediate"),
+                    "section_title": metadata.get("section_title", ""),
+                    "chunk_position": metadata.get("chunk_position", ""),
+                }
+                chunks.append(chunk_data)
+        
+        # Sort by chunk index
+        chunks.sort(key=lambda x: x.get("chunk_index", 0))
+        
+        # Apply pagination
+        total = len(chunks)
+        paginated_chunks = chunks[skip:skip+limit]
+        
+        return {
+            "chunks": paginated_chunks,
+            "total": total,
+            "skip": skip,
+            "limit": limit
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document chunks: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/collections/{collection_name}/documents")
 async def create_document(
     collection_name: str,
     document: DocumentCreate,
     background_tasks: BackgroundTasks
 ):
-    """Create a new document from text"""
+    """Create a new document from text with validation"""
     try:
-        if not document.content and not document.content.strip():
-            raise HTTPException(status_code=400, detail="Content is required")
+        # Step 1: Validate and sanitize content
+        is_valid, error_msg, sanitized_content = validate_content(document.content or "")
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=f"Content validation failed: {error_msg}")
+        
+        # Step 2: Validate chunking parameters
+        is_valid, error_msg = validate_chunking_parameters(
+            document.chunk_size or 1000,
+            document.chunk_overlap or 200,
+            document.chunking_strategy or "semantic",
+            document.max_chunks
+        )
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        # Use sanitized content
+        document.content = sanitized_content
         
         collection = chroma_client.get_or_create_collection(
             name=collection_name,
@@ -568,11 +1581,13 @@ async def create_document(
             "updated_at": datetime.utcnow().isoformat()
         }
         
-        # Prepare metadata
+        # Prepare metadata with enhanced fields
         metadata = {
             "name": document.metadata.name,
             "purpose": document.metadata.purpose or "",
             "tags": document.metadata.tags or "",
+            "author": document.metadata.author,
+            "source": document.metadata.source,
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
             **document.metadata.custom_metadata
@@ -588,6 +1603,9 @@ async def create_document(
             metadata,
             document.chunk_size,
             document.chunk_overlap,
+            document.chunking_strategy or "semantic",
+            document.chunk_separator,
+            document.max_chunks,
             version
         )
         
@@ -613,21 +1631,50 @@ async def upload_document(
     name: str = Form(...),
     purpose: str = Form(""),
     tags: str = Form(""),
-    chunk_size: int = Form(500),
-    chunk_overlap: int = Form(50),
+    author: str = Form(None),
+    source: str = Form(None),
+    chunk_size: int = Form(1000),
+    chunk_overlap: int = Form(200),
+    chunking_strategy: str = Form("semantic"),
+    chunk_separator: str = Form(None),
+    max_chunks: int = Form(None),
     custom_metadata: str = Form("{}"),
     create_new_version: bool = Form(False)
 ):
-    """Upload and process a document file"""
+    """Upload and process a document file with validation"""
     try:
-        # Read file content
+        # Step 1: Validate file size
         file_content = await file.read()
+        file_size = len(file_content)
         
-        # Parse file based on type
-        content = parse_file(file.filename, file_content)
+        is_valid, error_msg = validate_file_size(file_size)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
         
-        if not content or not content.strip():
-            raise HTTPException(status_code=400, detail="File appears to be empty or unreadable")
+        # Step 2: Sanitize filename
+        sanitized_filename = sanitize_filename(file.filename)
+        
+        # Step 3: Parse file based on type
+        try:
+            content = parse_file(sanitized_filename, file_content)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error parsing file: {str(e)}")
+        
+        # Step 4: Validate and sanitize content
+        is_valid, error_msg, sanitized_content = validate_content(content)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=f"Content validation failed: {error_msg}")
+        
+        content = sanitized_content
+        
+        # Step 5: Validate chunking parameters
+        is_valid, error_msg = validate_chunking_parameters(
+            chunk_size, chunk_overlap, chunking_strategy, max_chunks
+        )
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
         
         collection = chroma_client.get_or_create_collection(
             name=collection_name,
@@ -660,19 +1707,38 @@ async def upload_document(
         except json.JSONDecodeError:
             custom_meta = {}
         
-        # Prepare metadata
+        # Prepare metadata with enhanced fields
         metadata = {
             "name": name,
-            "purpose": purpose,
-            "tags": tags,
-            "filename": file.filename,
-            "file_type": Path(file.filename).suffix.lower(),
+            "purpose": purpose or "",
+            "tags": tags or "",
+            "author": author or None,
+            "source": source or None,
+            "filename": sanitized_filename,
+            "original_filename": file.filename,
+            "file_type": Path(sanitized_filename).suffix.lower(),
+            "file_size": file_size,
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
             **custom_meta
         }
         
         # Queue background processing
+        # Convert max_chunks to int if provided
+        max_chunks_int = None
+        if max_chunks is not None:
+            try:
+                max_chunks_int = int(max_chunks) if max_chunks != "null" and max_chunks != "" else None
+            except (ValueError, TypeError):
+                max_chunks_int = None
+        
+        # Store chunking parameters in metadata
+        metadata["chunking_strategy"] = chunking_strategy or "semantic"
+        if chunk_separator:
+            metadata["chunk_separator"] = chunk_separator
+        if max_chunks_int:
+            metadata["max_chunks"] = max_chunks_int
+        
         background_tasks.add_task(
             process_document_async,
             task_id,
@@ -682,6 +1748,9 @@ async def upload_document(
             metadata,
             chunk_size,
             chunk_overlap,
+            chunking_strategy or "semantic",
+            chunk_separator if chunk_separator and chunk_separator != "null" else None,
+            max_chunks_int,
             version
         )
         
@@ -742,9 +1811,21 @@ async def update_document(
         # Use updated content or keep existing
         updated_content = update.content if update.content else existing_content
         
-        # Get chunk parameters
-        chunk_size = update.chunk_size if update.chunk_size else existing_metadata.get("chunk_size", 500)
-        chunk_overlap = update.chunk_overlap if update.chunk_overlap else existing_metadata.get("chunk_overlap", 50)
+        # Get chunk parameters - use update values if provided, otherwise fall back to existing metadata
+        chunk_size = update.chunk_size if update.chunk_size is not None else existing_metadata.get("chunk_size", 1000)
+        chunk_overlap = update.chunk_overlap if update.chunk_overlap is not None else existing_metadata.get("chunk_overlap", 200)
+        chunking_strategy = update.chunking_strategy if update.chunking_strategy else existing_metadata.get("chunking_strategy", "semantic")
+        chunk_separator = update.chunk_separator if update.chunk_separator is not None else existing_metadata.get("chunk_separator")
+        max_chunks = update.max_chunks if update.max_chunks is not None else existing_metadata.get("max_chunks")
+        
+        # Store chunking parameters in metadata for future reference
+        updated_metadata["chunk_size"] = chunk_size
+        updated_metadata["chunk_overlap"] = chunk_overlap
+        updated_metadata["chunking_strategy"] = chunking_strategy
+        if chunk_separator:
+            updated_metadata["chunk_separator"] = chunk_separator
+        if max_chunks:
+            updated_metadata["max_chunks"] = max_chunks
         
         # Delete old chunks
         try:
@@ -778,7 +1859,7 @@ async def update_document(
             "updated_at": datetime.utcnow().isoformat()
         }
         
-        # Queue background processing
+        # Queue background processing with all chunking parameters
         background_tasks.add_task(
             process_document_async,
             task_id,
@@ -787,7 +1868,10 @@ async def update_document(
             updated_content,
             updated_metadata,
             chunk_size,
-            chunk_overlap
+            chunk_overlap,
+            chunking_strategy,
+            chunk_separator,
+            max_chunks
         )
         
         return {

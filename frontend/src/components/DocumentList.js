@@ -42,6 +42,9 @@ import UploadFileIcon from '@mui/icons-material/UploadFile';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import TextFieldsIcon from '@mui/icons-material/TextFields';
+import InfoIcon from '@mui/icons-material/Info';
+import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
+import PreviewIcon from '@mui/icons-material/Preview';
 import { useHotkeys } from 'react-hotkeys-hook';
 import { documentsAPI, tasksAPI, bulkAPI } from '../services/api';
 import { notify } from '../utils/notifications';
@@ -65,7 +68,12 @@ const DocumentList = ({ onRefresh }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedDocuments, setSelectedDocuments] = useState([]);
   const [advancedMode, setAdvancedMode] = useState(false);
-  const [selectedPreset, setSelectedPreset] = useState('default');
+  const [selectedPreset, setSelectedPreset] = useState('semantic');
+  const [expandedAdvice, setExpandedAdvice] = useState(null); // Track which preset's advice is expanded
+  const [showChunkPreview, setShowChunkPreview] = useState(false); // Show/hide chunk preview
+  const [selectedDocumentChunks, setSelectedDocumentChunks] = useState(null); // Store chunks for selected document
+  const [loadingChunks, setLoadingChunks] = useState(false);
+  const [chunksDialogOpen, setChunksDialogOpen] = useState(false);
 
   const [formData, setFormData] = useState({
     name: '',
@@ -73,10 +81,10 @@ const DocumentList = ({ onRefresh }) => {
     tags: '',
     content: '',
     custom_metadata: '',
-    chunk_size: 500,
-    chunk_overlap: 50,
-    separator: '\n\n',  // Advanced: custom separator
-    chunk_by: 'size',   // Advanced: 'size', 'lines', 'paragraphs', 'sentences'
+    chunk_size: 1000,
+    chunk_overlap: 200,
+    chunking_strategy: 'semantic',  // Backend strategy: 'semantic', 'size', 'lines', 'paragraphs', 'sentences', 'custom'
+    separator: '\n\n',  // Advanced: custom separator (for paragraphs or custom strategy)
     max_chunks: null,   // Advanced: limit total chunks
   });
 
@@ -156,62 +164,162 @@ const DocumentList = ({ onRefresh }) => {
     return () => clearInterval(interval);
   }, [processingTasks]);
 
-  // Intelligent presets with use cases
+  // Comprehensive chunking strategy presets with interactive advice
   const chunkPresets = {
-    'qa': {
-      name: 'Q&A / Definitions',
-      size: 200,
-      overlap: 20,
+    'semantic': {
+      name: 'Semantic (Recommended)',
+      strategy: 'semantic',
+      size: 1000,
+      overlap: 200,
+      separator: null,
+      icon: '🧠',
+      description: 'AI-powered smart chunking that respects meaning and context. Best for most documents.',
+      detailedAdvice: 'Automatically detects sentence and paragraph boundaries. Adapts chunk size based on document type (smaller for definitions, larger for books). Preserves semantic coherence.',
+      example: 'Content: "Machine learning is a subset of artificial intelligence. It enables computers to learn from data without explicit programming.\n\nDeep learning uses neural networks..."\n\nResult: Chunks maintain complete thoughts and sentences together.',
+      whenToUse: [
+        'General documents (articles, blogs, books)',
+        'Mixed content types',
+        'When you want optimal retrieval quality',
+        'First-time users (recommended default)'
+      ],
+      whenNotToUse: [
+        'Structured data with fixed formats',
+        'When you need exact control over chunk boundaries',
+        'Code files (use code-specific strategy instead)'
+      ]
+    },
+    'size': {
+      name: 'Fixed Size',
+      strategy: 'size',
+      size: 1000,
+      overlap: 200,
+      separator: null,
+      icon: '📏',
+      description: 'Character-based chunking with fixed size. Consistent chunks regardless of content.',
+      detailedAdvice: 'Splits text at word boundaries to respect your exact size limit. Good when you need uniform chunk sizes. Overlap helps maintain context between chunks.',
+      example: 'Size: 500 chars, Overlap: 50 chars\n\nContent: "The quick brown fox jumps over the lazy dog. The dog was sleeping peacefully..."\n\nResult: Chunks are exactly ~500 characters, with 50 characters overlapping between adjacent chunks.',
+      whenToUse: [
+        'When you need consistent chunk sizes',
+        'Simple documents without complex structure',
+        'When you want predictable behavior',
+        'Processing large volumes of similar content'
+      ],
+      whenNotToUse: [
+        'Documents with important sentence boundaries',
+        'Code or structured data',
+        'When meaning preservation is critical'
+      ]
+    },
+    'sentences': {
+      name: 'By Sentences',
+      strategy: 'sentences',
+      size: 1000,
+      overlap: 200,
+      separator: null,
+      icon: '💬',
+      description: 'Chunks respect sentence boundaries. Maintains complete thoughts.',
+      detailedAdvice: 'Never splits mid-sentence. Groups sentences together until reaching size limit. Perfect for natural language content where sentence integrity matters.',
+      example: 'Content: "Artificial intelligence is transforming industries. Machine learning drives innovation. Deep learning enables breakthroughs."\n\nResult: Each chunk contains complete sentences, never breaking mid-sentence.',
+      whenToUse: [
+        'Narrative content (stories, articles)',
+        'When sentence integrity is important',
+        'Natural language documents',
+        'Documents with clear sentence structure'
+      ],
+      whenNotToUse: [
+        'Code or technical specs',
+        'Structured lists or tables',
+        'Documents without sentence markers'
+      ]
+    },
+    'paragraphs': {
+      name: 'By Paragraphs',
+      strategy: 'paragraphs',
+      size: 2000,
+      overlap: 200,
+      separator: '\n\n',
+      icon: '📑',
+      description: 'One paragraph per chunk. Ideal for well-structured documents.',
+      detailedAdvice: 'Uses double newlines (\\n\\n) as paragraph separators. If a paragraph exceeds the size limit, it will be split by sentences. Great for documents with clear paragraph structure.',
+      example: 'Content:\n\n"Paragraph 1 text here.\n\nParagraph 2 text here.\n\nParagraph 3 text here."\n\nResult: Each paragraph becomes its own chunk, preserving topic boundaries.',
+      whenToUse: [
+        'Well-formatted articles and essays',
+        'Documents with clear paragraph structure',
+        'When paragraph-level retrieval is desired',
+        'Academic papers and reports'
+      ],
+      whenNotToUse: [
+        'Single-paragraph documents',
+        'Documents without paragraph breaks',
+        'When you need smaller chunks'
+      ]
+    },
+    'lines': {
+      name: 'By Lines',
+      strategy: 'lines',
+      size: null,
+      overlap: 0,
       separator: '\n',
-      chunk_by: 'lines',
-      icon: '❓',
-      description: 'One question per chunk. Perfect for FAQ documents or glossaries.',
-      example: 'Q: What is X?\nA: X is...',
-      useCase: 'FAQs, glossaries, Q&A pairs'
-    },
-    'default': {
-      name: 'General Documents',
-      size: 500,
-      overlap: 50,
-      separator: '\n\n',
-      chunk_by: 'size',
-      icon: '📄',
-      description: 'Balanced chunking for most documents. Good for articles and general content.',
-      example: 'Regular paragraphs, mixed content',
-      useCase: 'Articles, guides, general docs'
-    },
-    'policy': {
-      name: 'Policies / Long Docs',
-      size: 800,
-      overlap: 100,
-      separator: '\n\n',
-      chunk_by: 'size',
-      icon: '📋',
-      description: 'Large chunks with more overlap. Best for detailed policies and procedures.',
-      example: 'Long sections with context',
-      useCase: 'Policies, manuals, legal docs'
+      icon: '📝',
+      description: 'One line per chunk. Perfect for structured lists and line-based data.',
+      detailedAdvice: 'Each line becomes a separate chunk. No overlap by default. Ideal for structured data where each line is an independent unit.',
+      example: 'Content:\n"Apple\nBanana\nCherry\nDate"\n\nResult: 4 separate chunks, one per line.',
+      whenToUse: [
+        'FAQs (Q&A format)',
+        'Glossaries and dictionaries',
+        'To-do lists and checklists',
+        'Structured line-by-line data',
+        'CSV-like content'
+      ],
+      whenNotToUse: [
+        'Paragraphs or prose',
+        'When context between lines matters',
+        'Long-form documents',
+        'When you need overlapping chunks'
+      ]
     },
     'code': {
       name: 'Code / Technical',
-      size: 400,
-      overlap: 40,
+      strategy: 'paragraphs',
+      size: 1500,
+      overlap: 150,
       separator: '\n\n',
-      chunk_by: 'paragraphs',
       icon: '💻',
-      description: 'Function/block-level chunking. Preserves code structure.',
-      example: 'Functions, classes, code blocks',
-      useCase: 'Code, API docs, technical specs'
+      description: 'Optimized for code, API docs, and technical documentation.',
+      detailedAdvice: 'Uses paragraph-level chunking with code-friendly settings. Preserves function/class boundaries. Good for preserving code block integrity.',
+      example: 'Content:\n\n"def calculate_sum(a, b):\n    return a + b\n\nclass Calculator:\n    def __init__(self):\n        ..."\n\nResult: Functions and classes stay together as coherent chunks.',
+      whenToUse: [
+        'Source code documentation',
+        'API documentation',
+        'Technical specifications',
+        'Code snippets and examples'
+      ],
+      whenNotToUse: [
+        'Regular text documents',
+        'When semantic meaning is more important'
+      ]
     },
-    'list': {
-      name: 'Lists / Line Items',
-      size: 100,
-      overlap: 0,
-      separator: '\n',
-      chunk_by: 'lines',
-      icon: '📝',
-      description: 'Each line is a chunk. No overlap. For item lists or short entries.',
-      example: '- Item 1\n- Item 2\n- Item 3',
-      useCase: 'To-do lists, inventories, catalogs'
+    'custom': {
+      name: 'Custom Separator',
+      strategy: 'custom',
+      size: 1000,
+      overlap: 200,
+      separator: '---',
+      icon: '⚙️',
+      description: 'Use a custom separator string to define chunk boundaries.',
+      detailedAdvice: 'Split text at your custom separator. Useful for documents with known structure markers. Specify your separator string (e.g., "---", "CHAPTER", "##").',
+      example: 'Separator: "---"\n\nContent: "Section 1---Section 2---Section 3"\n\nResult: 3 chunks split at "---" markers.',
+      whenToUse: [
+        'Documents with custom section markers',
+        'Structured data with known delimiters',
+        'When you know the document structure',
+        'Processing specialized formats'
+      ],
+      whenNotToUse: [
+        'General documents',
+        'When structure is unknown',
+        'First-time use (try semantic first)'
+      ]
     }
   };
 
@@ -222,16 +330,17 @@ const DocumentList = ({ onRefresh }) => {
       tags: '',
       content: '',
       custom_metadata: '',
-      chunk_size: 500,
-      chunk_overlap: 50,
+      chunk_size: 1000,
+      chunk_overlap: 200,
+      chunking_strategy: 'semantic',
       separator: '\n\n',
-      chunk_by: 'size',
       max_chunks: null,
     });
     setSelectedFile(null);
     setUploadMethod(0);
     setAdvancedMode(false);
-    setSelectedPreset('default');
+    setSelectedPreset('semantic');
+    setShowChunkPreview(false);
   };
 
   const applyPreset = (presetKey) => {
@@ -239,11 +348,15 @@ const DocumentList = ({ onRefresh }) => {
     setSelectedPreset(presetKey);
     setFormData({
       ...formData,
-      chunk_size: preset.size,
-      chunk_overlap: preset.overlap,
-      separator: preset.separator,
-      chunk_by: preset.chunk_by,
+      chunking_strategy: preset.strategy,
+      chunk_size: preset.size || 1000,
+      chunk_overlap: preset.overlap || 200,
+      separator: preset.separator !== null ? preset.separator : '\n\n',
     });
+    // Auto-show preview when strategy changes
+    if (formData.content && formData.content.trim() && !showChunkPreview) {
+      setShowChunkPreview(true);
+    }
   };
 
   const handleFileChange = (event) => {
@@ -251,8 +364,100 @@ const DocumentList = ({ onRefresh }) => {
     handleFileSelection(file);
   };
 
+  // Validation constants (match backend)
+  const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
+  const MIN_CHUNK_SIZE = 10;
+  const MAX_CHUNK_SIZE = 50000;
+  const SUPPORTED_FILE_TYPES = ['.pdf', '.docx', '.doc', '.txt', '.text', '.json'];
+
+  // Pre-upload validation
+  const validateFile = (file) => {
+    if (!file) {
+      return { valid: false, error: 'No file selected' };
+    }
+
+    // Check file size
+    if (file.size > MAX_FILE_SIZE) {
+      return {
+        valid: false,
+        error: `File size (${(file.size / 1024 / 1024).toFixed(2)}MB) exceeds maximum allowed size (${MAX_FILE_SIZE / 1024 / 1024}MB)`
+      };
+    }
+
+    if (file.size === 0) {
+      return { valid: false, error: 'File is empty' };
+    }
+
+    // Check file extension
+    const extension = file.name.toLowerCase().substring(file.name.lastIndexOf('.'));
+    if (!SUPPORTED_FILE_TYPES.includes(extension)) {
+      return {
+        valid: false,
+        error: `Unsupported file type: ${extension}. Supported: ${SUPPORTED_FILE_TYPES.join(', ')}`
+      };
+    }
+
+    return { valid: true };
+  };
+
+  const validateChunkingParameters = () => {
+    const chunkSize = formData.chunk_size || 1000;
+    const chunkOverlap = formData.chunk_overlap || 200;
+    const strategy = formData.chunking_strategy || 'semantic';
+
+    if (chunkSize < MIN_CHUNK_SIZE) {
+      return {
+        valid: false,
+        error: `Chunk size (${chunkSize}) is too small (minimum ${MIN_CHUNK_SIZE} characters)`
+      };
+    }
+
+    if (chunkSize > MAX_CHUNK_SIZE) {
+      return {
+        valid: false,
+        error: `Chunk size (${chunkSize}) is too large (maximum ${MAX_CHUNK_SIZE} characters)`
+      };
+    }
+
+    if (chunkOverlap < 0) {
+      return { valid: false, error: 'Chunk overlap cannot be negative' };
+    }
+
+    if (chunkOverlap >= chunkSize) {
+      return {
+        valid: false,
+        error: `Chunk overlap (${chunkOverlap}) must be less than chunk size (${chunkSize})`
+      };
+    }
+
+    if (formData.max_chunks !== null && formData.max_chunks <= 0) {
+      return { valid: false, error: 'max_chunks must be a positive integer' };
+    }
+
+    return { valid: true };
+  };
+
+  const validateContent = (content) => {
+    if (!content || !content.trim()) {
+      return { valid: false, error: 'Content is empty or missing' };
+    }
+
+    if (content.trim().length < 1) {
+      return { valid: false, error: 'Content contains no meaningful text' };
+    }
+
+    return { valid: true };
+  };
+
   const handleFileSelection = (file) => {
     if (!file) return;
+    
+    // Validate file before setting
+    const validation = validateFile(file);
+    if (!validation.valid) {
+      notify.error(validation.error);
+      return;
+    }
     
     setSelectedFile(file);
     
@@ -275,23 +480,448 @@ const DocumentList = ({ onRefresh }) => {
     }
     
     setFormData({ ...formData, name: finalName });
+    
+    // Show file info
+    notify.success(`File selected: ${file.name} (${(file.size / 1024).toFixed(1)}KB)`);
   };
 
+  // Chunking preview function - mimics backend chunking logic
+  const previewChunks = React.useMemo(() => {
+    const text = formData.content.trim() || '';
+    if (!text) return [];
+
+    const strategy = formData.chunking_strategy || 'semantic';
+    const chunkSize = formData.chunk_size || 1000;
+    const overlap = formData.chunk_overlap || 200;
+    const separator = formData.separator || '\n\n';
+    const maxChunks = formData.max_chunks || null;
+
+    try {
+      // Lines strategy
+      if (strategy === 'lines') {
+        const lines = text.split('\n').filter(line => line.trim());
+        return (maxChunks ? lines.slice(0, maxChunks) : lines).map((line, idx) => ({
+          index: idx + 1,
+          text: line.trim(),
+          length: line.trim().length
+        }));
+      }
+
+      // Paragraphs strategy
+      if (strategy === 'paragraphs') {
+        const paragraphs = text.split(separator).filter(p => p.trim());
+        let processedChunks = [];
+        
+        for (const para of paragraphs) {
+          const trimmed = para.trim();
+          
+          // If paragraph exceeds chunk_size, split it by sentences
+          if (trimmed.length > chunkSize) {
+            const sentencePattern = /([.!?]+)\s+/g;
+            const parts = trimmed.split(sentencePattern);
+            const sentences = [];
+            for (let i = 0; i < parts.length; i += 2) {
+              if (parts[i] && parts[i].trim()) {
+                sentences.push(parts[i] + (parts[i + 1] || ''));
+              }
+            }
+            
+            // Build chunks from sentences, respecting chunk_size
+            let currentChunk = [];
+            let currentLength = 0;
+            
+            for (const sentence of sentences) {
+              const trimmedSentence = sentence.trim();
+              if (!trimmedSentence) continue;
+              
+              const sentenceLength = trimmedSentence.length;
+              
+              if (currentLength + sentenceLength + 1 > chunkSize && currentChunk.length > 0) {
+                processedChunks.push(currentChunk.join(' '));
+                
+                if (overlap > 0) {
+                  const overlapCount = Math.max(1, Math.floor(currentChunk.length * overlap / chunkSize));
+                  currentChunk = currentChunk.slice(-overlapCount);
+                  currentChunk.push(trimmedSentence);
+                  currentLength = currentChunk.join(' ').length;
+                } else {
+                  currentChunk = [trimmedSentence];
+                  currentLength = sentenceLength;
+                }
+              } else {
+                currentChunk.push(trimmedSentence);
+                currentLength += sentenceLength + 1;
+              }
+              
+              if (maxChunks && processedChunks.length >= maxChunks) break;
+            }
+            
+            if (currentChunk.length > 0 && (!maxChunks || processedChunks.length < maxChunks)) {
+              processedChunks.push(currentChunk.join(' '));
+            }
+            
+            if (maxChunks && processedChunks.length >= maxChunks) break;
+          } else {
+            // Paragraph fits within chunk_size, use it as-is
+            processedChunks.push(trimmed);
+            if (maxChunks && processedChunks.length >= maxChunks) break;
+          }
+        }
+        
+        // Apply overlap between paragraph-based chunks (but ensure chunks don't exceed chunk_size)
+        if (overlap > 0 && processedChunks.length > 1) {
+          const overlapped = [];
+          for (let i = 0; i < processedChunks.length; i++) {
+            let chunk = processedChunks[i];
+            if (i > 0) {
+              const prevChunk = processedChunks[i - 1];
+              // Calculate how much overlap we can add without exceeding chunk_size
+              const maxOverlap = Math.min(overlap, prevChunk.length);
+              const overlapText = prevChunk.slice(-maxOverlap);
+              const combinedLength = overlapText.length + separator.length + chunk.length;
+              
+              // If adding overlap would exceed chunk_size, reduce the main chunk content
+              if (combinedLength > chunkSize) {
+                const availableSpace = chunkSize - overlapText.length - separator.length;
+                if (availableSpace > 0) {
+                  // Truncate the main chunk to make room for overlap
+                  chunk = chunk.slice(0, availableSpace);
+                  chunk = overlapText + separator + chunk;
+                } else {
+                  // If there's no room even after truncation, just use overlap + minimal content
+                  chunk = overlapText + separator + (chunk.length > 0 ? chunk.slice(0, Math.max(0, chunkSize - overlapText.length - separator.length)) : '');
+                }
+              } else {
+                chunk = overlapText + separator + chunk;
+              }
+            }
+            overlapped.push(chunk);
+          }
+          processedChunks = overlapped;
+        }
+        
+        const result = (maxChunks ? processedChunks.slice(0, maxChunks) : processedChunks).map((chunk, idx) => ({
+          index: idx + 1,
+          text: chunk.trim(),
+          length: chunk.trim().length
+        }));
+        return result;
+      }
+
+      // Sentences strategy
+      if (strategy === 'sentences') {
+        const sentencePattern = /([.!?]+)\s+/g;
+        const parts = text.split(sentencePattern);
+        const sentences = [];
+        for (let i = 0; i < parts.length; i += 2) {
+          if (parts[i] && parts[i].trim()) {
+            sentences.push(parts[i] + (parts[i + 1] || ''));
+          }
+        }
+
+        const chunks = [];
+        let currentChunk = [];
+        let currentLength = 0;
+
+        for (const sentence of sentences) {
+          const trimmed = sentence.trim();
+          if (!trimmed) continue;
+          
+          const sentenceLength = trimmed.length;
+          
+          if (currentLength + sentenceLength + 1 > chunkSize && currentChunk.length > 0) {
+            chunks.push(currentChunk.join(' '));
+            
+            if (overlap > 0) {
+              const overlapCount = Math.max(1, Math.floor(currentChunk.length * overlap / chunkSize));
+              currentChunk = currentChunk.slice(-overlapCount);
+              currentChunk.push(trimmed);
+              currentLength = currentChunk.join(' ').length;
+              
+              // Ensure overlap + new sentence doesn't exceed chunk_size (if it does, start fresh)
+              if (currentLength > chunkSize) {
+                currentChunk = [trimmed];
+                currentLength = sentenceLength;
+              }
+            } else {
+              currentChunk = [trimmed];
+              currentLength = sentenceLength;
+            }
+          } else {
+            currentChunk.push(trimmed);
+            currentLength += sentenceLength + 1;
+          }
+          
+          if (maxChunks && chunks.length >= maxChunks) break;
+        }
+
+        if (currentChunk.length > 0 && (!maxChunks || chunks.length < maxChunks)) {
+          chunks.push(currentChunk.join(' '));
+        }
+
+        return chunks.map((chunk, idx) => ({
+          index: idx + 1,
+          text: chunk,
+          length: chunk.length
+        }));
+      }
+
+      // Size strategy
+      if (strategy === 'size') {
+        const words = text.split(/\s+/);
+        const chunks = [];
+        let currentChunk = [];
+        let currentLength = 0;
+
+        for (const word of words) {
+          const wordWithSpace = word + ' ';
+          const wordLength = wordWithSpace.length;
+
+          if (currentLength + wordLength > chunkSize && currentChunk.length > 0) {
+            chunks.push(currentChunk.join(' '));
+            
+            if (overlap > 0) {
+              const overlapWords = Math.max(1, Math.floor(currentChunk.length * overlap / chunkSize));
+              currentChunk = currentChunk.slice(-overlapWords);
+              currentChunk.push(word);
+              currentLength = currentChunk.join(' ').length;
+              
+              // Ensure overlap + new word doesn't exceed chunk_size (if it does, start fresh)
+              if (currentLength > chunkSize) {
+                currentChunk = [word];
+                currentLength = word.length;
+              }
+            } else {
+              currentChunk = [word];
+              currentLength = word.length;
+            }
+          } else {
+            currentChunk.push(word);
+            currentLength += wordLength;
+          }
+          
+          if (maxChunks && chunks.length >= maxChunks) break;
+        }
+
+        if (currentChunk.length > 0 && (!maxChunks || chunks.length < maxChunks)) {
+          chunks.push(currentChunk.join(' '));
+        }
+
+        return chunks.map((chunk, idx) => ({
+          index: idx + 1,
+          text: chunk,
+          length: chunk.length
+        }));
+      }
+
+      // Custom separator strategy
+      if (strategy === 'custom') {
+        const chunks = text.split(separator).filter(c => c.trim()).map(c => c.trim());
+        let result = chunks;
+        
+        // If chunks exceed chunk_size, split them further
+        if (chunkSize) {
+          const sizedChunks = [];
+          for (const chunk of chunks) {
+            if (chunk.length > chunkSize) {
+              // Split large chunks by sentences or words
+              const words = chunk.split(/\s+/);
+              let currentChunk = [];
+              let currentLength = 0;
+              
+              for (const word of words) {
+                const wordWithSpace = word + ' ';
+                const wordLength = wordWithSpace.length;
+                
+                if (currentLength + wordLength > chunkSize && currentChunk.length > 0) {
+                  sizedChunks.push(currentChunk.join(' '));
+                  
+                  if (overlap > 0) {
+                    const overlapWords = Math.max(1, Math.floor(currentChunk.length * overlap / chunkSize));
+                    currentChunk = currentChunk.slice(-overlapWords);
+                    currentChunk.push(word);
+                    currentLength = currentChunk.join(' ').length;
+                  } else {
+                    currentChunk = [word];
+                    currentLength = word.length;
+                  }
+                } else {
+                  currentChunk.push(word);
+                  currentLength += wordLength;
+                }
+                
+                if (maxChunks && sizedChunks.length >= maxChunks) break;
+              }
+              
+              if (currentChunk.length > 0 && (!maxChunks || sizedChunks.length < maxChunks)) {
+                sizedChunks.push(currentChunk.join(' '));
+              }
+              
+              if (maxChunks && sizedChunks.length >= maxChunks) break;
+            } else {
+              sizedChunks.push(chunk);
+              if (maxChunks && sizedChunks.length >= maxChunks) break;
+            }
+          }
+          result = sizedChunks;
+        }
+        
+        // Apply overlap (but ensure chunks don't exceed chunk_size)
+        if (overlap > 0 && result.length > 1 && chunkSize) {
+          const overlapped = [];
+          for (let i = 0; i < result.length; i++) {
+            let chunk = result[i];
+            if (i > 0) {
+              const prevChunk = result[i - 1];
+              const maxOverlap = Math.min(overlap, prevChunk.length);
+              const overlapText = prevChunk.slice(-maxOverlap);
+              const combinedLength = overlapText.length + separator.length + chunk.length;
+              
+              if (combinedLength > chunkSize) {
+                const availableSpace = chunkSize - overlapText.length - separator.length;
+                if (availableSpace > 0) {
+                  chunk = chunk.slice(0, availableSpace);
+                  chunk = overlapText + separator + chunk;
+                } else {
+                  chunk = overlapText + separator + (chunk.length > 0 ? chunk.slice(0, Math.max(0, chunkSize - overlapText.length - separator.length)) : '');
+                }
+              } else {
+                chunk = overlapText + separator + chunk;
+              }
+            }
+            overlapped.push(chunk);
+          }
+          result = overlapped;
+        } else if (overlap > 0 && result.length > 1 && !chunkSize) {
+          // If no chunk_size specified, just add overlap as-is
+          const overlapped = [];
+          for (let i = 0; i < result.length; i++) {
+            let chunk = result[i];
+            if (i > 0) {
+              const prevChunk = result[i - 1];
+              const overlapText = prevChunk.slice(-Math.min(overlap, prevChunk.length));
+              chunk = overlapText + separator + chunk;
+            }
+            overlapped.push(chunk);
+          }
+          result = overlapped;
+        }
+        
+        return (maxChunks ? result.slice(0, maxChunks) : result).map((chunk, idx) => ({
+          index: idx + 1,
+          text: chunk,
+          length: chunk.length
+        }));
+      }
+
+      // Semantic strategy (simplified approximation)
+      if (strategy === 'semantic') {
+        const paragraphs = text.split(/\n\s*\n/);
+        const chunks = [];
+        let currentChunk = [];
+        let currentLength = 0;
+
+        for (const para of paragraphs) {
+          const sentences = para.match(/[^.!?]+[.!?]+/g) || [para];
+          
+          for (const sentence of sentences) {
+            const trimmed = sentence.trim();
+            if (!trimmed) continue;
+            
+            const sentenceLength = trimmed.length;
+            
+            if (currentLength + sentenceLength + 1 > chunkSize && currentChunk.length > 0) {
+              chunks.push(currentChunk.join(' '));
+              
+              if (overlap > 0) {
+                // Calculate overlap: keep last N sentences based on overlap size
+                const overlapCount = Math.max(1, Math.floor(currentChunk.length * overlap / chunkSize));
+                currentChunk = currentChunk.slice(-overlapCount);
+                currentChunk.push(trimmed);
+                currentLength = currentChunk.join(' ').length;
+                
+                // Ensure overlap + new sentence doesn't exceed chunk_size (if it does, start fresh)
+                if (currentLength > chunkSize) {
+                  currentChunk = [trimmed];
+                  currentLength = sentenceLength;
+                }
+              } else {
+                currentChunk = [trimmed];
+                currentLength = sentenceLength;
+              }
+            } else {
+              currentChunk.push(trimmed);
+              currentLength += sentenceLength + 1;
+            }
+            
+            if (maxChunks && chunks.length >= maxChunks) break;
+          }
+          
+          if (maxChunks && chunks.length >= maxChunks) break;
+        }
+
+        if (currentChunk.length > 0 && (!maxChunks || chunks.length < maxChunks)) {
+          chunks.push(currentChunk.join(' '));
+        }
+
+        return chunks.map((chunk, idx) => ({
+          index: idx + 1,
+          text: chunk,
+          length: chunk.length
+        }));
+      }
+
+      return [{
+        index: 1,
+        text: text,
+        length: text.length
+      }];
+    } catch (error) {
+      console.error('Error previewing chunks:', error);
+      return [{
+        index: 1,
+        text: text,
+        length: text.length
+      }];
+    }
+  }, [formData.content, formData.chunking_strategy, formData.chunk_size, formData.chunk_overlap, formData.separator, formData.max_chunks]);
+
   const handleCreateDocument = async () => {
-    if (!formData.name.trim()) {
-      notify.warning('Please provide a document name');
+    // Pre-submit validation
+    if (!formData.name || !formData.name.trim()) {
+      notify.error('Document name is required');
       return;
     }
 
-    if (uploadMethod === 0 && !formData.content.trim()) {
-      notify.warning('Please provide text content');
+    // Validate chunking parameters
+    const chunkValidation = validateChunkingParameters();
+    if (!chunkValidation.valid) {
+      notify.error(chunkValidation.error);
       return;
     }
 
-    if (uploadMethod === 1 && !selectedFile) {
-      notify.warning('Please select a file to upload');
-      return;
+    // Validate content (for text upload)
+    if (uploadMethod === 0) {
+      const contentValidation = validateContent(formData.content);
+      if (!contentValidation.valid) {
+        notify.error(contentValidation.error);
+        return;
+      }
     }
+
+    // Validate file (for file upload)
+    if (uploadMethod === 1) {
+      if (!selectedFile) {
+        notify.error('Please select a file to upload');
+        return;
+      }
+      const fileValidation = validateFile(selectedFile);
+      if (!fileValidation.valid) {
+        notify.error(fileValidation.error);
+        return;
+      }
+    }
+
 
     try {
       setSubmitting(true);
@@ -307,6 +937,13 @@ const DocumentList = ({ onRefresh }) => {
         formDataToSend.append('tags', formData.tags);
         formDataToSend.append('chunk_size', formData.chunk_size.toString());
         formDataToSend.append('chunk_overlap', formData.chunk_overlap.toString());
+        formDataToSend.append('chunking_strategy', formData.chunking_strategy || 'semantic');
+        if (formData.separator) {
+          formDataToSend.append('chunk_separator', formData.separator);
+        }
+        if (formData.max_chunks) {
+          formDataToSend.append('max_chunks', formData.max_chunks.toString());
+        }
         formDataToSend.append('custom_metadata', formData.custom_metadata || '{}');
 
         response = await documentsAPI.uploadFile(collectionName, formDataToSend);
@@ -323,6 +960,9 @@ const DocumentList = ({ onRefresh }) => {
           content: formData.content,
           chunk_size: formData.chunk_size,
           chunk_overlap: formData.chunk_overlap,
+          chunking_strategy: formData.chunking_strategy || 'semantic',
+          chunk_separator: formData.separator || null,
+          max_chunks: formData.max_chunks || null,
         };
 
         response = await documentsAPI.create(collectionName, documentData);
@@ -343,6 +983,7 @@ const DocumentList = ({ onRefresh }) => {
       }
 
       setCreateDialogOpen(false);
+      setExpandedAdvice(null);
       resetForm();
       await fetchDocuments();
       onRefresh();
@@ -351,6 +992,22 @@ const DocumentList = ({ onRefresh }) => {
       console.error('Error creating document:', err);
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleViewChunks = async (document) => {
+    try {
+      setLoadingChunks(true);
+      setSelectedDocument(document);
+      setChunksDialogOpen(true);
+      
+      const chunksData = await documentsAPI.getChunks(collectionName, document.id);
+      setSelectedDocumentChunks(chunksData);
+    } catch (err) {
+      notify.error('Failed to load chunks: ' + (err.response?.data?.detail || err.message));
+      console.error('Error loading chunks:', err);
+    } finally {
+      setLoadingChunks(false);
     }
   };
 
@@ -372,6 +1029,9 @@ const DocumentList = ({ onRefresh }) => {
         },
         chunk_size: formData.chunk_size,
         chunk_overlap: formData.chunk_overlap,
+        chunking_strategy: formData.chunking_strategy || 'semantic',
+        chunk_separator: formData.separator || null,
+        max_chunks: formData.max_chunks || null,
       };
 
       if (formData.content.trim()) {
@@ -402,6 +1062,7 @@ const DocumentList = ({ onRefresh }) => {
 
       setEditDialogOpen(false);
       setSelectedDocument(null);
+      setExpandedAdvice(null);
       resetForm();
       await fetchDocuments();
       onRefresh();
@@ -431,6 +1092,7 @@ const DocumentList = ({ onRefresh }) => {
 
   const openEditDialog = (document) => {
     setSelectedDocument(document);
+    const existingStrategy = document.metadata.chunking_strategy || 'semantic';
     setFormData({
       name: document.metadata.name || '',
       purpose: document.metadata.purpose || '',
@@ -441,9 +1103,18 @@ const DocumentList = ({ onRefresh }) => {
         null,
         2
       ),
-      chunk_size: document.metadata.chunk_size || 500,
-      chunk_overlap: document.metadata.chunk_overlap || 50,
+      chunk_size: document.metadata.chunk_size || 1000,
+      chunk_overlap: document.metadata.chunk_overlap || 200,
+      chunking_strategy: existingStrategy,
+      separator: document.metadata.chunk_separator || '\n\n',
+      max_chunks: document.metadata.max_chunks || null,
     });
+    setSelectedPreset(existingStrategy === 'semantic' ? 'semantic' : 
+                     existingStrategy === 'size' ? 'size' :
+                     existingStrategy === 'lines' ? 'lines' :
+                     existingStrategy === 'paragraphs' ? 'paragraphs' :
+                     existingStrategy === 'sentences' ? 'sentences' :
+                     existingStrategy === 'custom' ? 'custom' : 'semantic');
     setEditDialogOpen(true);
   };
 
@@ -744,6 +1415,15 @@ const DocumentList = ({ onRefresh }) => {
                       </Typography>
                     </TableCell>
                     <TableCell align="right">
+                      <Tooltip title="View Chunks">
+                        <IconButton
+                          size="small"
+                          color="info"
+                          onClick={() => handleViewChunks(doc)}
+                        >
+                          <PreviewIcon />
+                        </IconButton>
+                      </Tooltip>
                       <Tooltip title="Edit">
                         <IconButton
                           size="small"
@@ -768,24 +1448,75 @@ const DocumentList = ({ onRefresh }) => {
                     <TableCell colSpan={8} sx={{ py: 0, borderBottom: expandedRows[doc.id] ? undefined : 'none' }}>
                       <Collapse in={expandedRows[doc.id]} timeout="auto" unmountOnExit>
                         <Box sx={{ p: 2, bgcolor: 'grey.50' }}>
-                          <Typography variant="subtitle2" gutterBottom>
-                            Content Preview:
-                          </Typography>
-                          <Typography
-                            variant="body2"
-                            color="text.secondary"
-                            sx={{
-                              whiteSpace: 'pre-wrap',
-                              maxHeight: 200,
-                              overflow: 'auto',
-                              p: 2,
-                              bgcolor: 'white',
-                              borderRadius: 1,
-                            }}
-                          >
-                            {doc.content.substring(0, 500)}
-                            {doc.content.length > 500 && '...'}
-                          </Typography>
+                          <Grid container spacing={2}>
+                            <Grid item xs={12} md={6}>
+                              <Typography variant="subtitle2" gutterBottom>
+                                📋 Metadata
+                              </Typography>
+                              <Stack spacing={1} sx={{ mb: 2 }}>
+                                {doc.metadata.document_type && (
+                                  <Box>
+                                    <Typography variant="caption" color="text.secondary">Document Type:</Typography>
+                                    <Chip label={doc.metadata.document_type} size="small" sx={{ ml: 1 }} />
+                                  </Box>
+                                )}
+                                {doc.metadata.author && doc.metadata.author !== 'unknown' && (
+                                  <Box>
+                                    <Typography variant="caption" color="text.secondary">Author:</Typography>
+                                    <Typography variant="body2" component="span" sx={{ ml: 1 }}>{doc.metadata.author}</Typography>
+                                  </Box>
+                                )}
+                                {doc.metadata.source && (
+                                  <Box>
+                                    <Typography variant="caption" color="text.secondary">Source:</Typography>
+                                    <Chip label={doc.metadata.source} size="small" variant="outlined" sx={{ ml: 1 }} />
+                                  </Box>
+                                )}
+                                {doc.metadata.chunking_strategy && (
+                                  <Box>
+                                    <Typography variant="caption" color="text.secondary">Chunking Strategy:</Typography>
+                                    <Chip label={doc.metadata.chunking_strategy} size="small" color="primary" variant="outlined" sx={{ ml: 1 }} />
+                                  </Box>
+                                )}
+                                {doc.metadata.created_at && (
+                                  <Box>
+                                    <Typography variant="caption" color="text.secondary">Created:</Typography>
+                                    <Typography variant="body2" component="span" sx={{ ml: 1 }}>
+                                      {new Date(doc.metadata.created_at).toLocaleString()}
+                                    </Typography>
+                                  </Box>
+                                )}
+                                {doc.metadata.content_length && (
+                                  <Box>
+                                    <Typography variant="caption" color="text.secondary">Content Length:</Typography>
+                                    <Typography variant="body2" component="span" sx={{ ml: 1 }}>
+                                      {doc.metadata.content_length.toLocaleString()} chars, {doc.metadata.word_count?.toLocaleString() || Math.floor(doc.metadata.content_length / 5)} words
+                                    </Typography>
+                                  </Box>
+                                )}
+                              </Stack>
+                            </Grid>
+                            <Grid item xs={12} md={6}>
+                              <Typography variant="subtitle2" gutterBottom>
+                                📄 Content Preview:
+                              </Typography>
+                              <Typography
+                                variant="body2"
+                                color="text.secondary"
+                                sx={{
+                                  whiteSpace: 'pre-wrap',
+                                  maxHeight: 200,
+                                  overflow: 'auto',
+                                  p: 2,
+                                  bgcolor: 'white',
+                                  borderRadius: 1,
+                                }}
+                              >
+                                {doc.content.substring(0, 500)}
+                                {doc.content.length > 500 && '...'}
+                              </Typography>
+                            </Grid>
+                          </Grid>
                         </Box>
                       </Collapse>
                     </TableCell>
@@ -895,11 +1626,11 @@ const DocumentList = ({ onRefresh }) => {
             </Box>
 
             {!advancedMode ? (
-              // BASIC MODE - Smart Presets
+              // BASIC MODE - Smart Presets with Interactive Advice
               <>
                 <Grid container spacing={2} sx={{ mb: 2 }}>
                   {Object.entries(chunkPresets).map(([key, preset]) => (
-                    <Grid item xs={12} sm={6} key={key}>
+                    <Grid item xs={12} sm={6} md={4} key={key}>
                       <Card
                         sx={{
                           cursor: 'pointer',
@@ -907,71 +1638,188 @@ const DocumentList = ({ onRefresh }) => {
                           borderColor: selectedPreset === key ? 'primary.main' : 'divider',
                           bgcolor: selectedPreset === key ? 'primary.50' : 'background.paper',
                           transition: 'all 0.2s',
+                          height: '100%',
+                          display: 'flex',
+                          flexDirection: 'column',
                           '&:hover': {
                             borderColor: 'primary.main',
                             transform: 'translateY(-2px)',
+                            boxShadow: 2,
                           },
                         }}
                         onClick={() => applyPreset(key)}
                       >
-                        <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
-                          <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
-                            <Typography variant="h6" sx={{ mr: 1 }}>
-                              {preset.icon}
-                            </Typography>
-                            <Typography variant="subtitle2" fontWeight="bold">
-                              {preset.name}
-                            </Typography>
+                        <CardContent sx={{ p: 2, '&:last-child': { pb: 2 }, flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                              <Typography variant="h6" sx={{ mr: 1 }}>
+                                {preset.icon}
+                              </Typography>
+                              <Typography variant="subtitle2" fontWeight="bold">
+                                {preset.name}
+                              </Typography>
+                            </Box>
+                            <IconButton
+                              size="small"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setExpandedAdvice(expandedAdvice === key ? null : key);
+                              }}
+                              sx={{ ml: 1 }}
+                            >
+                              <HelpOutlineIcon fontSize="small" />
+                            </IconButton>
                           </Box>
-                          <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.5 }}>
+                          <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1, flexGrow: 1 }}>
                             {preset.description}
                           </Typography>
-                          <Chip
-                            label={`${preset.size} chars, ${preset.overlap} overlap`}
-                            size="small"
-                            variant="outlined"
-                            sx={{ mt: 0.5 }}
-                          />
+                          <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                            {preset.size && (
+                              <Chip
+                                label={`${preset.size} chars`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            )}
+                            {preset.overlap !== null && preset.overlap !== undefined && (
+                              <Chip
+                                label={`${preset.overlap} overlap`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            )}
+                          </Box>
                         </CardContent>
+                        <Collapse in={expandedAdvice === key}>
+                          <Box sx={{ p: 2, bgcolor: 'grey.50', borderTop: 1, borderColor: 'divider' }}>
+                            <Typography variant="caption" fontWeight="bold" display="block" gutterBottom>
+                              📚 Detailed Information:
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1, whiteSpace: 'pre-line' }}>
+                              {preset.detailedAdvice}
+                            </Typography>
+                            <Typography variant="caption" fontWeight="bold" display="block" gutterBottom sx={{ mt: 1 }}>
+                              ✅ When to Use:
+                            </Typography>
+                            <Typography variant="caption" component="ul" sx={{ m: 0, pl: 2, mb: 1 }}>
+                              {preset.whenToUse.map((item, idx) => (
+                                <li key={idx}>{item}</li>
+                              ))}
+                            </Typography>
+                            <Typography variant="caption" fontWeight="bold" display="block" gutterBottom>
+                              ❌ When NOT to Use:
+                            </Typography>
+                            <Typography variant="caption" component="ul" sx={{ m: 0, pl: 2 }}>
+                              {preset.whenNotToUse.map((item, idx) => (
+                                <li key={idx}>{item}</li>
+                              ))}
+                            </Typography>
+                            <Typography variant="caption" fontWeight="bold" display="block" gutterBottom sx={{ mt: 1 }}>
+                              💡 Example:
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary" display="block" sx={{ whiteSpace: 'pre-line', fontFamily: 'monospace', bgcolor: 'background.paper', p: 1, borderRadius: 0.5 }}>
+                              {preset.example}
+                            </Typography>
+                          </Box>
+                        </Collapse>
                       </Card>
                     </Grid>
                   ))}
                 </Grid>
 
-                <Alert severity="info" icon={<DescriptionIcon />}>
-                  <Typography variant="body2" fontWeight="bold" gutterBottom>
-                    💡 Choosing the Right Strategy:
-                  </Typography>
-                  <Typography variant="caption" component="div">
-                    • <strong>Q&A:</strong> {chunkPresets.qa.example}<br/>
-                    • <strong>General:</strong> {chunkPresets.default.example}<br/>
-                    • <strong>Policy:</strong> {chunkPresets.policy.example}<br/>
-                    • <strong>Code:</strong> {chunkPresets.code.example}<br/>
-                    • <strong>Lists:</strong> {chunkPresets.list.example}
-                  </Typography>
-                </Alert>
+                {selectedPreset && chunkPresets[selectedPreset] && (
+                  <Alert severity="success" icon={<InfoIcon />} sx={{ mb: 2 }}>
+                    <Typography variant="body2" fontWeight="bold" gutterBottom>
+                      Selected: {chunkPresets[selectedPreset].name}
+                    </Typography>
+                    <Typography variant="caption" component="div">
+                      {chunkPresets[selectedPreset].description}
+                      {chunkPresets[selectedPreset].detailedAdvice && (
+                        <>
+                          <br /><br />
+                          <strong>Tip:</strong> Click the <HelpOutlineIcon sx={{ fontSize: 14, verticalAlign: 'middle', mx: 0.5 }} /> icon on any strategy card for detailed information, examples, and when to use it.
+                        </>
+                      )}
+                    </Typography>
+                  </Alert>
+                )}
               </>
             ) : (
               // ADVANCED MODE - Full Control
               <>
                 <Alert severity="warning" sx={{ mb: 2 }}>
                   <Typography variant="caption">
-                    <strong>⚙️ Advanced Mode:</strong> Full control over chunking. Only use if you know what you're doing!
+                    <strong>⚙️ Advanced Mode:</strong> Full control over chunking parameters. Use this when presets don't meet your needs.
                   </Typography>
                 </Alert>
 
                 <FormControl fullWidth sx={{ mb: 2 }}>
-                  <InputLabel>Chunk By</InputLabel>
+                  <InputLabel>Chunking Strategy *</InputLabel>
                   <Select
-                    value={formData.chunk_by}
-                    label="Chunk By"
-                    onChange={(e) => setFormData({ ...formData, chunk_by: e.target.value })}
+                    value={formData.chunking_strategy}
+                    label="Chunking Strategy *"
+                    onChange={(e) => {
+                      const strategy = e.target.value;
+                      const updates = { chunking_strategy: strategy };
+                      
+                      // Auto-set separator based on strategy
+                      if (strategy === 'paragraphs') {
+                        updates.separator = '\n\n';
+                      } else if (strategy === 'lines') {
+                        updates.separator = '\n';
+                      } else if (strategy === 'custom' && !formData.separator) {
+                        updates.separator = '---';
+                      }
+                      
+                      setFormData({ ...formData, ...updates });
+                      
+                      // Auto-show preview when strategy changes if content exists
+                      if (formData.content && formData.content.trim() && !showChunkPreview) {
+                        setShowChunkPreview(true);
+                      }
+                    }}
+                    disabled={submitting}
                   >
-                    <MenuItem value="size">Character Size (default)</MenuItem>
-                    <MenuItem value="lines">Lines (one per chunk)</MenuItem>
-                    <MenuItem value="paragraphs">Paragraphs (\\n\\n separator)</MenuItem>
-                    <MenuItem value="sentences">Sentences (. separator)</MenuItem>
+                    <MenuItem value="semantic">
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold">🧠 Semantic (Recommended)</Typography>
+                        <Typography variant="caption" color="text.secondary">Smart chunking with context preservation</Typography>
+                      </Box>
+                    </MenuItem>
+                    <MenuItem value="size">
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold">📏 Fixed Size</Typography>
+                        <Typography variant="caption" color="text.secondary">Character-based with word boundaries</Typography>
+                      </Box>
+                    </MenuItem>
+                    <MenuItem value="sentences">
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold">💬 By Sentences</Typography>
+                        <Typography variant="caption" color="text.secondary">Respects sentence boundaries</Typography>
+                      </Box>
+                    </MenuItem>
+                    <MenuItem value="paragraphs">
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold">📑 By Paragraphs</Typography>
+                        <Typography variant="caption" color="text.secondary">Uses paragraph separators</Typography>
+                      </Box>
+                    </MenuItem>
+                    <MenuItem value="lines">
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold">📝 By Lines</Typography>
+                        <Typography variant="caption" color="text.secondary">One line per chunk</Typography>
+                      </Box>
+                    </MenuItem>
+                    <MenuItem value="custom">
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold">⚙️ Custom Separator</Typography>
+                        <Typography variant="caption" color="text.secondary">Split by custom separator string</Typography>
+                      </Box>
+                    </MenuItem>
                   </Select>
+                  <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
+                    Choose the chunking strategy. See Basic mode for detailed information about each strategy.
+                  </Typography>
                 </FormControl>
 
                 <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 2 }}>
@@ -991,12 +1839,12 @@ const DocumentList = ({ onRefresh }) => {
                     }}
                     onBlur={() => {
                       if (formData.chunk_size === '') {
-                        setFormData({ ...formData, chunk_size: 500 });
+                        setFormData({ ...formData, chunk_size: 1000 });
                       }
                     }}
-                    disabled={submitting}
-                    helperText="Characters per chunk"
-                    inputProps={{ inputMode: 'numeric' }}
+                    disabled={submitting || formData.chunking_strategy === 'lines'}
+                    helperText={formData.chunking_strategy === 'lines' ? 'Not used for line-based chunking' : 'Characters per chunk (100-5000 recommended)'}
+                    inputProps={{ inputMode: 'numeric', min: 1, max: 10000 }}
                   />
                   <TextField
                     label="Chunk Overlap"
@@ -1014,37 +1862,196 @@ const DocumentList = ({ onRefresh }) => {
                     }}
                     onBlur={() => {
                       if (formData.chunk_overlap === '') {
-                        setFormData({ ...formData, chunk_overlap: 50 });
+                        setFormData({ ...formData, chunk_overlap: 200 });
                       }
                     }}
-                    disabled={submitting}
-                    helperText="Overlap between chunks"
-                    inputProps={{ inputMode: 'numeric' }}
+                    disabled={submitting || formData.chunking_strategy === 'lines'}
+                    helperText={formData.chunking_strategy === 'lines' ? 'Not used for line-based chunking' : 'Overlap between chunks (typically 10-20% of chunk size)'}
+                    inputProps={{ inputMode: 'numeric', min: 0 }}
                   />
                 </Box>
 
-                <TextField
-                  fullWidth
-                  label="Custom Separator"
-                  value={formData.separator}
-                  onChange={(e) => setFormData({ ...formData, separator: e.target.value })}
-                  disabled={submitting}
-                  helperText="Text separator for chunking (e.g., \\n\\n for paragraphs, \\n for lines)"
-                  sx={{ mb: 2 }}
-                />
+                {(formData.chunking_strategy === 'paragraphs' || formData.chunking_strategy === 'custom') && (
+                  <TextField
+                    fullWidth
+                    label="Separator"
+                    value={formData.separator}
+                    onChange={(e) => setFormData({ ...formData, separator: e.target.value })}
+                    disabled={submitting}
+                    helperText={
+                      formData.chunking_strategy === 'paragraphs' 
+                        ? 'Paragraph separator (default: \\n\\n for double newline)'
+                        : 'Custom separator string (e.g., "---", "CHAPTER", "##"). Text will be split at this separator.'
+                    }
+                    required={formData.chunking_strategy === 'custom'}
+                    sx={{ mb: 2 }}
+                  />
+                )}
 
                 <TextField
                   fullWidth
                   label="Max Chunks (optional)"
                   type="number"
                   value={formData.max_chunks || ''}
-                  onChange={(e) => setFormData({ ...formData, max_chunks: e.target.value ? parseInt(e.target.value) : null })}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    if (value === '') {
+                      setFormData({ ...formData, max_chunks: null });
+                    } else {
+                      const parsed = parseInt(value);
+                      if (!isNaN(parsed) && parsed > 0) {
+                        setFormData({ ...formData, max_chunks: parsed });
+                      }
+                    }
+                  }}
                   disabled={submitting}
-                  helperText="Limit total number of chunks (leave empty for no limit)"
+                  helperText="Limit total number of chunks (leave empty for no limit). Useful for testing or when you want to process only a portion of a document."
+                  inputProps={{ inputMode: 'numeric', min: 1 }}
+                  sx={{ mb: 2 }}
                 />
+
+                <Alert severity="info" sx={{ mt: 2 }}>
+                  <Typography variant="caption">
+                    <strong>💡 Pro Tip:</strong> Each strategy has specific use cases. Switch to Basic mode to see interactive advice, examples, and recommendations for each strategy.
+                  </Typography>
+                </Alert>
               </>
             )}
           </Box>
+
+          {/* Chunk Preview Section */}
+          {uploadMethod === 0 && formData.content.trim() && (
+            <Box sx={{ mb: 2 }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <PreviewIcon fontSize="small" />
+                  Chunk Preview
+                </Typography>
+                <Button
+                  size="small"
+                  onClick={() => setShowChunkPreview(!showChunkPreview)}
+                  startIcon={showChunkPreview ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                  sx={{ textTransform: 'none' }}
+                >
+                  {showChunkPreview ? 'Hide Preview' : 'Show Preview'}
+                </Button>
+              </Box>
+              <Collapse in={showChunkPreview}>
+                <Card variant="outlined" sx={{ bgcolor: 'grey.50' }}>
+                  <CardContent>
+                    {previewChunks.length > 0 ? (
+                      <>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2, flexWrap: 'wrap', gap: 1 }}>
+                          <Typography variant="body2" fontWeight="medium">
+                            Preview: {previewChunks.length} chunk{previewChunks.length !== 1 ? 's' : ''} will be created
+                          </Typography>
+                          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                            <Chip
+                              label={`Strategy: ${formData.chunking_strategy || 'semantic'}`}
+                              size="small"
+                              color="primary"
+                              variant="outlined"
+                            />
+                            {formData.chunk_size && formData.chunking_strategy !== 'lines' && (
+                              <Chip
+                                label={`Size: ${formData.chunk_size} chars`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            )}
+                            {formData.chunk_overlap !== null && formData.chunk_overlap !== undefined && formData.chunking_strategy !== 'lines' && (
+                              <Chip
+                                label={`Overlap: ${formData.chunk_overlap} chars`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            )}
+                          </Box>
+                        </Box>
+                        <Box sx={{ maxHeight: 400, overflow: 'auto' }}>
+                          {previewChunks.slice(0, 10).map((chunk, idx) => (
+                            <Card
+                              key={idx}
+                              variant="outlined"
+                              sx={{
+                                mb: 1.5,
+                                bgcolor: 'background.paper',
+                                '&:hover': {
+                                  boxShadow: 2,
+                                },
+                              }}
+                            >
+                              <CardContent sx={{ p: 2 }}>
+                                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                                  <Chip
+                                    label={`Chunk ${chunk.index}`}
+                                    size="small"
+                                    color="primary"
+                                    sx={{ fontWeight: 'bold' }}
+                                  />
+                                  <Typography variant="caption" color="text.secondary">
+                                    {chunk.length} characters
+                                  </Typography>
+                                </Box>
+                                <Typography
+                                  variant="body2"
+                                  sx={{
+                                    whiteSpace: 'pre-wrap',
+                                    wordBreak: 'break-word',
+                                    fontFamily: 'monospace',
+                                    fontSize: '0.875rem',
+                                    lineHeight: 1.6,
+                                    maxHeight: 150,
+                                    overflow: 'auto',
+                                    bgcolor: 'grey.50',
+                                    p: 1.5,
+                                    borderRadius: 1,
+                                    border: '1px solid',
+                                    borderColor: 'divider',
+                                  }}
+                                >
+                                  {chunk.text.length > 500 ? `${chunk.text.substring(0, 500)}...` : chunk.text}
+                                </Typography>
+                              </CardContent>
+                            </Card>
+                          ))}
+                          {previewChunks.length > 10 && (
+                            <Alert severity="info" sx={{ mt: 1 }}>
+                              <Typography variant="caption">
+                                Showing first 10 of {previewChunks.length} chunks. All chunks will be processed when you create the document.
+                              </Typography>
+                            </Alert>
+                          )}
+                        </Box>
+                        <Alert severity="info" sx={{ mt: 2 }}>
+                          <Typography variant="caption">
+                            <strong>Note:</strong> This preview shows how your document will be split into chunks based on your selected strategy. 
+                            Each chunk will be converted to an embedding vector for similarity search. Adjust chunk size, overlap, or strategy to change the chunking behavior.
+                          </Typography>
+                        </Alert>
+                      </>
+                    ) : (
+                      <Alert severity="warning">
+                        <Typography variant="body2">
+                          No chunks to preview. Please add content to see how it will be chunked.
+                        </Typography>
+                      </Alert>
+                    )}
+                  </CardContent>
+                </Card>
+              </Collapse>
+            </Box>
+          )}
+
+          {/* Show preview hint for file uploads */}
+          {uploadMethod === 1 && (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              <Typography variant="caption">
+                <strong>Tip:</strong> After uploading your file, you can preview the chunks by editing the document. 
+                The chunk preview will show how your document will be split based on the selected strategy.
+              </Typography>
+            </Alert>
+          )}
 
           <TextField
             margin="dense"
@@ -1061,7 +2068,7 @@ const DocumentList = ({ onRefresh }) => {
           />
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => { setCreateDialogOpen(false); resetForm(); }} disabled={submitting}>
+          <Button onClick={() => { setCreateDialogOpen(false); setExpandedAdvice(null); setShowChunkPreview(false); resetForm(); }} disabled={submitting}>
             Cancel
           </Button>
           <Button onClick={handleCreateDocument} variant="contained" disabled={submitting}>
@@ -1139,10 +2146,10 @@ const DocumentList = ({ onRefresh }) => {
             </Box>
 
             {!advancedMode ? (
-              // BASIC MODE - Smart Presets
+              // BASIC MODE - Smart Presets (Edit Dialog - Compact View)
               <>
-                <Grid container spacing={2} sx={{ mb: 2 }}>
-                  {Object.entries(chunkPresets).slice(0, 4).map(([key, preset]) => (
+                <Grid container spacing={1.5} sx={{ mb: 2 }}>
+                  {Object.entries(chunkPresets).map(([key, preset]) => (
                     <Grid item xs={12} sm={6} key={key}>
                       <Card
                         sx={{
@@ -1153,45 +2160,121 @@ const DocumentList = ({ onRefresh }) => {
                           transition: 'all 0.2s',
                           '&:hover': {
                             borderColor: 'primary.main',
-                            transform: 'translateY(-2px)',
+                            transform: 'translateY(-1px)',
                           },
                         }}
                         onClick={() => applyPreset(key)}
                       >
                         <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
-                          <Box sx={{ display: 'flex', alignItems: 'center', mb: 0.5 }}>
-                            <Typography variant="body2" sx={{ mr: 0.5 }}>
-                              {preset.icon}
+                          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                              <Typography variant="body2" sx={{ mr: 0.5 }}>
+                                {preset.icon}
+                              </Typography>
+                              <Typography variant="caption" fontWeight="bold">
+                                {preset.name}
+                              </Typography>
+                            </Box>
+                            <IconButton
+                              size="small"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setExpandedAdvice(expandedAdvice === key ? null : key);
+                              }}
+                              sx={{ ml: 1, p: 0.5 }}
+                            >
+                              <HelpOutlineIcon fontSize="small" />
+                            </IconButton>
+                          </Box>
+                          <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.5 }}>
+                            {preset.description}
+                          </Typography>
+                          <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                            {preset.size && (
+                              <Chip
+                                label={`${preset.size} chars`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            )}
+                            {preset.overlap !== null && preset.overlap !== undefined && (
+                              <Chip
+                                label={`${preset.overlap} overlap`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            )}
+                          </Box>
+                        </CardContent>
+                        <Collapse in={expandedAdvice === key}>
+                          <Box sx={{ p: 1.5, bgcolor: 'grey.50', borderTop: 1, borderColor: 'divider' }}>
+                            <Typography variant="caption" fontWeight="bold" display="block" gutterBottom>
+                              📚 {preset.detailedAdvice}
                             </Typography>
-                            <Typography variant="caption" fontWeight="bold">
-                              {preset.name}
+                            <Typography variant="caption" fontWeight="bold" display="block" gutterBottom sx={{ mt: 1 }}>
+                              ✅ When to Use:
+                            </Typography>
+                            <Typography variant="caption" component="ul" sx={{ m: 0, pl: 2, mb: 1 }}>
+                              {preset.whenToUse.slice(0, 3).map((item, idx) => (
+                                <li key={idx}>{item}</li>
+                              ))}
                             </Typography>
                           </Box>
-                          <Chip
-                            label={`${preset.size} / ${preset.overlap}`}
-                            size="small"
-                            variant="outlined"
-                          />
-                        </CardContent>
+                        </Collapse>
                       </Card>
                     </Grid>
                   ))}
                 </Grid>
+                {selectedPreset && chunkPresets[selectedPreset] && (
+                  <Alert severity="success" icon={<InfoIcon />} sx={{ mb: 2 }}>
+                    <Typography variant="caption">
+                      <strong>Selected:</strong> {chunkPresets[selectedPreset].name} - {chunkPresets[selectedPreset].description}
+                    </Typography>
+                  </Alert>
+                )}
               </>
             ) : (
-              // ADVANCED MODE - Full Control
+              // ADVANCED MODE - Full Control (Same as create dialog)
               <>
-                <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-                  <InputLabel>Chunk By</InputLabel>
+                <Alert severity="warning" sx={{ mb: 2 }}>
+                  <Typography variant="caption">
+                    <strong>⚙️ Advanced Mode:</strong> Full control over chunking parameters.
+                  </Typography>
+                </Alert>
+
+                <FormControl fullWidth sx={{ mb: 2 }}>
+                  <InputLabel>Chunking Strategy *</InputLabel>
                   <Select
-                    value={formData.chunk_by}
-                    label="Chunk By"
-                    onChange={(e) => setFormData({ ...formData, chunk_by: e.target.value })}
+                    value={formData.chunking_strategy}
+                    label="Chunking Strategy *"
+                    onChange={(e) => {
+                      const strategy = e.target.value;
+                      const updates = { chunking_strategy: strategy };
+                      
+                      // Auto-set separator based on strategy
+                      if (strategy === 'paragraphs') {
+                        updates.separator = '\n\n';
+                      } else if (strategy === 'lines') {
+                        updates.separator = '\n';
+                      } else if (strategy === 'custom' && !formData.separator) {
+                        updates.separator = '---';
+                      }
+                      
+                      setFormData({ ...formData, ...updates });
+                      
+                      // Auto-show preview when strategy changes if content exists
+                      if (formData.content && formData.content.trim() && !showChunkPreview) {
+                        setShowChunkPreview(true);
+                      }
+                    }}
+                    disabled={submitting}
                   >
-                    <MenuItem value="size">Character Size (default)</MenuItem>
-                    <MenuItem value="lines">Lines (one per chunk)</MenuItem>
-                    <MenuItem value="paragraphs">Paragraphs</MenuItem>
-                    <MenuItem value="sentences">Sentences</MenuItem>
+                    <MenuItem value="semantic">🧠 Semantic (Recommended)</MenuItem>
+                    <MenuItem value="size">📏 Fixed Size</MenuItem>
+                    <MenuItem value="sentences">💬 By Sentences</MenuItem>
+                    <MenuItem value="paragraphs">📑 By Paragraphs</MenuItem>
+                    <MenuItem value="lines">📝 By Lines</MenuItem>
+                    <MenuItem value="custom">⚙️ Custom Separator</MenuItem>
                   </Select>
                 </FormControl>
 
@@ -1211,12 +2294,8 @@ const DocumentList = ({ onRefresh }) => {
                         }
                       }
                     }}
-                    onBlur={() => {
-                      if (formData.chunk_size === '') {
-                        setFormData({ ...formData, chunk_size: 500 });
-                      }
-                    }}
-                    disabled={submitting}
+                    disabled={submitting || formData.chunking_strategy === 'lines'}
+                    helperText={formData.chunking_strategy === 'lines' ? 'Not used' : 'Characters per chunk'}
                     inputProps={{ inputMode: 'numeric' }}
                   />
                   <TextField
@@ -1234,18 +2313,206 @@ const DocumentList = ({ onRefresh }) => {
                         }
                       }
                     }}
-                    onBlur={() => {
-                      if (formData.chunk_overlap === '') {
-                        setFormData({ ...formData, chunk_overlap: 50 });
-                      }
-                    }}
-                    disabled={submitting}
+                    disabled={submitting || formData.chunking_strategy === 'lines'}
+                    helperText={formData.chunking_strategy === 'lines' ? 'Not used' : 'Overlap between chunks'}
                     inputProps={{ inputMode: 'numeric' }}
                   />
                 </Box>
+
+                {(formData.chunking_strategy === 'paragraphs' || formData.chunking_strategy === 'custom') && (
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="Separator"
+                    value={formData.separator}
+                    onChange={(e) => setFormData({ ...formData, separator: e.target.value })}
+                    disabled={submitting}
+                    helperText={formData.chunking_strategy === 'custom' ? 'Custom separator string' : 'Paragraph separator'}
+                    sx={{ mb: 2 }}
+                  />
+                )}
+
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Max Chunks (optional)"
+                  type="number"
+                  value={formData.max_chunks || ''}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    if (value === '') {
+                      setFormData({ ...formData, max_chunks: null });
+                    } else {
+                      const parsed = parseInt(value);
+                      if (!isNaN(parsed) && parsed > 0) {
+                        setFormData({ ...formData, max_chunks: parsed });
+                      }
+                    }
+                  }}
+                  disabled={submitting}
+                  helperText="Limit total number of chunks"
+                  sx={{ mb: 2 }}
+                />
               </>
             )}
           </Box>
+
+          {/* Chunk Preview Section for Edit Dialog */}
+          {formData.content && formData.content.trim() && (
+            <Box sx={{ mb: 2 }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <PreviewIcon fontSize="small" />
+                  Chunk Preview
+                </Typography>
+                <Button
+                  size="small"
+                  onClick={() => setShowChunkPreview(!showChunkPreview)}
+                  startIcon={showChunkPreview ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                  sx={{ textTransform: 'none' }}
+                >
+                  {showChunkPreview ? 'Hide Preview' : 'Show Preview'}
+                </Button>
+              </Box>
+              <Collapse in={showChunkPreview}>
+                <Card variant="outlined" sx={{ bgcolor: 'grey.50' }}>
+                  <CardContent>
+                    {previewChunks.length > 0 ? (
+                      <>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2, flexWrap: 'wrap', gap: 1 }}>
+                          <Typography variant="body2" fontWeight="medium">
+                            Preview: {previewChunks.length} chunk{previewChunks.length !== 1 ? 's' : ''} will be created
+                          </Typography>
+                          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                            <Chip
+                              label={`Strategy: ${formData.chunking_strategy || 'semantic'}`}
+                              size="small"
+                              color="primary"
+                              variant="outlined"
+                            />
+                            {formData.chunk_size && formData.chunking_strategy !== 'lines' && (
+                              <Chip
+                                label={`Size: ${formData.chunk_size} chars`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            )}
+                            {formData.chunk_overlap !== null && formData.chunk_overlap !== undefined && formData.chunking_strategy !== 'lines' && (
+                              <Chip
+                                label={`Overlap: ${formData.chunk_overlap} chars`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            )}
+                          </Box>
+                        </Box>
+                        <Box sx={{ maxHeight: 400, overflow: 'auto' }}>
+                          {previewChunks.slice(0, 10).map((chunk, idx) => (
+                            <Card
+                              key={idx}
+                              variant="outlined"
+                              sx={{
+                                mb: 1.5,
+                                bgcolor: 'background.paper',
+                                '&:hover': {
+                                  boxShadow: 2,
+                                },
+                              }}
+                            >
+                              <CardContent sx={{ p: 2 }}>
+                                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                                  <Chip
+                                    label={`Chunk ${chunk.index}`}
+                                    size="small"
+                                    color={
+                                      formData.chunking_strategy !== 'lines' && chunk.length > (formData.chunk_size || 1000)
+                                        ? 'error'
+                                        : formData.chunking_strategy !== 'lines' && chunk.length < (formData.chunk_size || 1000) * 0.5 && chunk.index < previewChunks.length
+                                        ? 'warning'
+                                        : 'primary'
+                                    }
+                                    sx={{ fontWeight: 'bold' }}
+                                  />
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <Typography 
+                                      variant="caption" 
+                                      color={
+                                        formData.chunking_strategy !== 'lines' && chunk.length > (formData.chunk_size || 1000)
+                                          ? 'error'
+                                          : 'text.secondary'
+                                      }
+                                      fontWeight={
+                                        formData.chunking_strategy !== 'lines' && chunk.length > (formData.chunk_size || 1000)
+                                          ? 'bold'
+                                          : 'normal'
+                                      }
+                                    >
+                                      {chunk.length} characters
+                                    </Typography>
+                                    {formData.chunking_strategy !== 'lines' && formData.chunk_size && (
+                                      <Typography variant="caption" color="text.secondary">
+                                        / {formData.chunk_size} max
+                                      </Typography>
+                                    )}
+                                  </Box>
+                                </Box>
+                                {formData.chunking_strategy !== 'lines' && chunk.length > (formData.chunk_size || 1000) && (
+                                  <Alert severity="error" sx={{ mb: 1 }}>
+                                    <Typography variant="caption">
+                                      ⚠️ This chunk exceeds the maximum size of {formData.chunk_size} characters. This should not happen - please report this issue.
+                                    </Typography>
+                                  </Alert>
+                                )}
+                                <Typography
+                                  variant="body2"
+                                  sx={{
+                                    whiteSpace: 'pre-wrap',
+                                    wordBreak: 'break-word',
+                                    fontFamily: 'monospace',
+                                    fontSize: '0.875rem',
+                                    lineHeight: 1.6,
+                                    maxHeight: 150,
+                                    overflow: 'auto',
+                                    bgcolor: 'grey.50',
+                                    p: 1.5,
+                                    borderRadius: 1,
+                                    border: '1px solid',
+                                    borderColor: 'divider',
+                                  }}
+                                >
+                                  {chunk.text.length > 500 ? `${chunk.text.substring(0, 500)}...` : chunk.text}
+                                </Typography>
+                              </CardContent>
+                            </Card>
+                          ))}
+                          {previewChunks.length > 10 && (
+                            <Alert severity="info" sx={{ mt: 1 }}>
+                              <Typography variant="caption">
+                                Showing first 10 of {previewChunks.length} chunks. All chunks will be processed when you update the document.
+                              </Typography>
+                            </Alert>
+                          )}
+                        </Box>
+                        <Alert severity="info" sx={{ mt: 2 }}>
+                          <Typography variant="caption">
+                            <strong>Note:</strong> This preview shows how your document will be split into chunks based on your selected strategy. 
+                            Updating the document will regenerate all embeddings with the new chunking strategy.
+                          </Typography>
+                        </Alert>
+                      </>
+                    ) : (
+                      <Alert severity="warning">
+                        <Typography variant="body2">
+                          No chunks to preview. Please add content to see how it will be chunked.
+                        </Typography>
+                      </Alert>
+                    )}
+                  </CardContent>
+                </Card>
+              </Collapse>
+            </Box>
+          )}
+
           <TextField
             margin="dense"
             label="Custom Metadata (JSON)"
@@ -1261,12 +2528,144 @@ const DocumentList = ({ onRefresh }) => {
           />
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => { setEditDialogOpen(false); resetForm(); }} disabled={submitting}>
+          <Button onClick={() => { setEditDialogOpen(false); setSelectedDocument(null); setExpandedAdvice(null); setShowChunkPreview(false); resetForm(); }} disabled={submitting}>
             Cancel
           </Button>
           <Button onClick={handleEditDocument} variant="contained" disabled={submitting}>
             {submitting ? <CircularProgress size={24} /> : 'Update'}
           </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Chunks Dialog */}
+      <Dialog
+        open={chunksDialogOpen}
+        onClose={() => setChunksDialogOpen(false)}
+        maxWidth="lg"
+        fullWidth
+      >
+        <DialogTitle>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Typography variant="h6">
+              Chunks & Metadata
+              {selectedDocument && ` - ${selectedDocument.metadata.name}`}
+            </Typography>
+            {selectedDocumentChunks && (
+              <Chip 
+                label={`${selectedDocumentChunks.total} chunks`} 
+                color="primary" 
+                variant="outlined"
+              />
+            )}
+          </Box>
+        </DialogTitle>
+        <DialogContent>
+          {loadingChunks ? (
+            <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}>
+              <CircularProgress />
+            </Box>
+          ) : selectedDocumentChunks && selectedDocumentChunks.chunks.length > 0 ? (
+            <Box sx={{ mt: 2 }}>
+              {selectedDocumentChunks.chunks.map((chunk, idx) => (
+                <Card key={chunk.id} variant="outlined" sx={{ mb: 2 }}>
+                  <CardContent>
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 2 }}>
+                      <Typography variant="h6" component="div">
+                        Chunk {chunk.chunk_number}
+                        {chunk.chunk_position && ` (${chunk.chunk_position})`}
+                      </Typography>
+                      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                        {chunk.content_type && (
+                          <Chip 
+                            label={chunk.content_type} 
+                            size="small" 
+                            color="info" 
+                            variant="outlined"
+                          />
+                        )}
+                        {chunk.difficulty_level && (
+                          <Chip 
+                            label={chunk.difficulty_level} 
+                            size="small" 
+                            color={
+                              chunk.difficulty_level === 'Beginner' ? 'success' :
+                              chunk.difficulty_level === 'Advanced' ? 'error' : 'default'
+                            }
+                            variant="outlined"
+                          />
+                        )}
+                        <Chip 
+                          label={`${chunk.length} chars`} 
+                          size="small" 
+                          variant="outlined"
+                        />
+                      </Box>
+                    </Box>
+                    
+                    {chunk.section_title && (
+                      <Typography variant="subtitle2" color="primary" gutterBottom>
+                        📑 {chunk.section_title}
+                      </Typography>
+                    )}
+                    
+                    {chunk.topics && chunk.topics !== 'general' && (
+                      <Box sx={{ mb: 2 }}>
+                        <Typography variant="caption" color="text.secondary">Topics: </Typography>
+                        {chunk.topics.split(', ').map((topic, i) => (
+                          <Chip 
+                            key={i}
+                            label={topic.trim()} 
+                            size="small" 
+                            sx={{ mr: 0.5, mb: 0.5 }}
+                          />
+                        ))}
+                      </Box>
+                    )}
+                    
+                    <Typography
+                      variant="body2"
+                      sx={{
+                        whiteSpace: 'pre-wrap',
+                        p: 2,
+                        bgcolor: 'grey.50',
+                        borderRadius: 1,
+                        maxHeight: 300,
+                        overflow: 'auto',
+                      }}
+                    >
+                      {chunk.content}
+                    </Typography>
+                    
+                    <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
+                      <Grid container spacing={1}>
+                        <Grid item xs={6} sm={3}>
+                          <Typography variant="caption" color="text.secondary">Words:</Typography>
+                          <Typography variant="body2">{chunk.word_count}</Typography>
+                        </Grid>
+                        <Grid item xs={6} sm={3}>
+                          <Typography variant="caption" color="text.secondary">Characters:</Typography>
+                          <Typography variant="body2">{chunk.length}</Typography>
+                        </Grid>
+                        {chunk.metadata.page_number && (
+                          <Grid item xs={6} sm={3}>
+                            <Typography variant="caption" color="text.secondary">Page:</Typography>
+                            <Typography variant="body2">{chunk.metadata.page_number}</Typography>
+                          </Grid>
+                        )}
+                      </Grid>
+                    </Box>
+                  </CardContent>
+                </Card>
+              ))}
+            </Box>
+          ) : (
+            <Alert severity="info" sx={{ mt: 2 }}>
+              No chunks found for this document.
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setChunksDialogOpen(false)}>Close</Button>
         </DialogActions>
       </Dialog>
     </Box>
