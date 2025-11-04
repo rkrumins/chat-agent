@@ -973,7 +973,7 @@ async def process_document_async(
     task_id: str,
     collection_name: str,
     document_id: str,
-    content: str,
+    content: Optional[str],
     metadata: Dict[str, Any],
     chunk_size: int = 500,
     chunk_overlap: int = 50,
@@ -981,7 +981,9 @@ async def process_document_async(
     chunk_separator: Optional[str] = None,
     max_chunks: Optional[int] = None,
     version: int = 1,
-    max_retries: int = 3
+    max_retries: int = 3,
+    file_content: Optional[bytes] = None,
+    filename: Optional[str] = None
 ):
     """Process document asynchronously with status updates, validation, and error recovery"""
     retry_count = 0
@@ -991,25 +993,38 @@ async def process_document_async(
         try:
             # Update status
             processing_status[task_id]["status"] = ProcessingStatus.PROCESSING
-            processing_status[task_id]["message"] = "Validating document content..." if retry_count == 0 else f"Retrying (attempt {retry_count + 1}/{max_retries + 1})..."
+            processing_status[task_id]["message"] = "Parsing file..." if file_content else ("Validating document content..." if retry_count == 0 else f"Retrying (attempt {retry_count + 1}/{max_retries + 1})...")
             processing_status[task_id]["progress"] = 5
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            # Step 1: Validate content
+            # Step 1: Parse file if file_content is provided (for file uploads)
+            if file_content is not None and filename:
+                try:
+                    content = parse_file(filename, file_content)
+                    processing_status[task_id]["message"] = "File parsed successfully, validating content..."
+                    processing_status[task_id]["progress"] = 8
+                    processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+                except Exception as e:
+                    raise ValueError(f"Error parsing file: {str(e)}")
+            
+            if content is None:
+                raise ValueError("No content provided - either content or file_content must be provided")
+            
+            # Step 2: Validate content
             is_valid, error_msg, sanitized_content = validate_content(content)
             if not is_valid:
                 raise ValueError(f"Content validation failed: {error_msg}")
             
             content = sanitized_content  # Use sanitized content
             
-            # Step 2: Validate chunking parameters
+            # Step 3: Validate chunking parameters
             is_valid, error_msg = validate_chunking_parameters(
                 chunk_size, chunk_overlap, chunking_strategy, max_chunks
             )
             if not is_valid:
                 raise ValueError(f"Chunking parameter validation failed: {error_msg}")
             
-            # Step 3: Check for duplicates (optional - can be disabled in metadata)
+            # Step 4: Check for duplicates (optional - can be disabled in metadata)
             check_duplicates = metadata.get("check_duplicates", True)
             if check_duplicates:
                 processing_status[task_id]["message"] = "Checking for duplicates..."
@@ -1038,7 +1053,7 @@ async def process_document_async(
             processing_status[task_id]["estimated_time"] = time_estimate.get("estimated_total_time", 0)
             processing_status[task_id]["estimated_chunks"] = time_estimate.get("estimated_chunks", 0)
             
-            # Step 5: Chunk document
+            # Step 6: Chunk document
             processing_status[task_id]["message"] = "Chunking document..."
             processing_status[task_id]["progress"] = 20
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
@@ -1057,7 +1072,7 @@ async def process_document_async(
                 max_chunks=max_chunks_param
             )
             
-            # Step 6: Validate chunk quality
+            # Step 7: Validate chunk quality
             processing_status[task_id]["message"] = "Validating chunk quality..."
             processing_status[task_id]["progress"] = 40
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
@@ -1097,7 +1112,7 @@ async def process_document_async(
                 embedding_function=embedding_function
             )
             
-            # Step 8: Detect document type
+            # Step 9: Detect document type
             processing_status[task_id]["message"] = "Detecting document type and creating contextual chunks..."
             processing_status[task_id]["progress"] = 60
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
@@ -1132,7 +1147,7 @@ async def process_document_async(
                     chunk_size = adaptive_chunk_size
                     chunk_overlap = adaptive_overlap
         
-            # Step 9: Prepare metadata for ChromaDB
+            # Step 10: Prepare metadata for ChromaDB
             processing_status[task_id]["message"] = "Preparing metadata..."
             processing_status[task_id]["progress"] = 70
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
@@ -1542,17 +1557,17 @@ async def create_document(
         # Queue background processing
         background_tasks.add_task(
             process_document_async,
-            task_id,
-            collection_name,
-            document_id,
-            document.content,
-            metadata,
-            document.chunk_size,
-            document.chunk_overlap,
-            document.chunking_strategy or "semantic",
-            document.chunk_separator,
-            document.max_chunks,
-            version
+            task_id=task_id,
+            collection_name=collection_name,
+            document_id=document_id,
+            content=document.content,
+            metadata=metadata,
+            chunk_size=document.chunk_size,
+            chunk_overlap=document.chunk_overlap,
+            chunking_strategy=document.chunking_strategy or "semantic",
+            chunk_separator=document.chunk_separator,
+            max_chunks=document.max_chunks,
+            version=version
         )
         
         return {
@@ -1587,7 +1602,7 @@ async def upload_document(
 ):
     """Upload and process a document file with validation"""
     try:
-        # Step 1: Validate file size
+        # Step 1: Validate file size (quick check)
         file_content = await file.read()
         file_size = len(file_content)
         
@@ -1595,30 +1610,25 @@ async def upload_document(
         if not is_valid:
             raise HTTPException(status_code=400, detail=error_msg)
         
-        # Step 2: Sanitize filename
+        # Step 2: Sanitize filename and validate extension (quick check)
         sanitized_filename = sanitize_filename(file.filename)
+        extension = Path(sanitized_filename).suffix.lower()
+        supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.text', '.json']
+        if extension not in supported_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {extension}. Supported: {', '.join(supported_extensions)}"
+            )
         
-        # Step 3: Parse file based on type
-        try:
-            content = parse_file(sanitized_filename, file_content)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error parsing file: {str(e)}")
-        
-        # Step 4: Validate and sanitize content
-        is_valid, error_msg, sanitized_content = validate_content(content)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=f"Content validation failed: {error_msg}")
-        
-        content = sanitized_content
-        
-        # Step 5: Validate chunking parameters
+        # Step 3: Validate chunking parameters (quick check)
         is_valid, error_msg = validate_chunking_parameters(
             chunk_size, chunk_overlap, chunking_strategy, max_chunks
         )
         if not is_valid:
             raise HTTPException(status_code=400, detail=error_msg)
+        
+        # NOTE: File parsing and content validation are now done in the background task
+        # to avoid blocking the UI. Only quick validations (size, extension) are done here.
         
         collection = chroma_client.get_or_create_collection(
             name=collection_name,
@@ -1681,19 +1691,23 @@ async def upload_document(
         if max_chunks_int:
             metadata["max_chunks"] = max_chunks_int
         
+        # Queue background processing - file_content is passed instead of parsed content
+        # This allows parsing to happen in the background, making the upload non-blocking
         background_tasks.add_task(
             process_document_async,
-            task_id,
-            collection_name,
-            document_id,
-            content,
-            metadata,
-            chunk_size,
-            chunk_overlap,
-            chunking_strategy or "semantic",
-            chunk_separator if chunk_separator and chunk_separator != "null" else None,
-            max_chunks_int,
-            version
+            task_id=task_id,
+            collection_name=collection_name,
+            document_id=document_id,
+            content=None,  # content will be None, indicating we need to parse file_content
+            metadata=metadata,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            chunking_strategy=chunking_strategy or "semantic",
+            chunk_separator=chunk_separator if chunk_separator and chunk_separator != "null" else None,
+            max_chunks=max_chunks_int,
+            version=version,
+            file_content=file_content,  # Pass raw file content for background parsing
+            filename=sanitized_filename  # Pass filename for parsing
         )
         
         return {
@@ -1804,16 +1818,16 @@ async def update_document(
         # Queue background processing with all chunking parameters
         background_tasks.add_task(
             process_document_async,
-            task_id,
-            collection_name,
-            document_id,
-            updated_content,
-            updated_metadata,
-            chunk_size,
-            chunk_overlap,
-            chunking_strategy,
-            chunk_separator,
-            max_chunks
+            task_id=task_id,
+            collection_name=collection_name,
+            document_id=document_id,
+            content=updated_content,
+            metadata=updated_metadata,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            chunking_strategy=chunking_strategy,
+            chunk_separator=chunk_separator,
+            max_chunks=max_chunks
         )
         
         return {

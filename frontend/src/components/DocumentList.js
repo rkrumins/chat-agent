@@ -130,7 +130,7 @@ const DocumentList = ({ onRefresh }) => {
     setFilteredDocuments(filtered);
   }, [searchQuery, documents]);
 
-  // Poll for task status
+  // Poll for task status - optimized to avoid unnecessary re-renders
   useEffect(() => {
     const taskIds = Object.keys(processingTasks);
     if (taskIds.length === 0) return;
@@ -139,27 +139,46 @@ const DocumentList = ({ onRefresh }) => {
       for (const taskId of taskIds) {
         try {
           const status = await tasksAPI.getStatus(taskId);
-          setProcessingTasks((prev) => ({
-            ...prev,
-            [taskId]: status,
-          }));
+          setProcessingTasks((prev) => {
+            const current = prev[taskId];
+            // Only update if status or progress changed to avoid unnecessary re-renders
+            if (!current || current.status !== status.status || current.progress !== status.progress) {
+              return {
+                ...prev,
+                [taskId]: status,
+              };
+            }
+            return prev;
+          });
 
-          if (status.status === 'completed' || status.status === 'failed') {
+          // Handle completion or failure
+          if (status.status === 'completed') {
+            notify.success(`Document "${status.message || 'processed'}" completed successfully!`);
             setTimeout(() => {
               setProcessingTasks((prev) => {
                 const updated = { ...prev };
                 delete updated[taskId];
                 return updated;
               });
+              // Refresh documents list when task completes
               fetchDocuments();
               onRefresh();
-            }, 2000);
+            }, 1000);
+          } else if (status.status === 'failed') {
+            notify.error(`Document processing failed: ${status.message || 'Unknown error'}`);
+            setTimeout(() => {
+              setProcessingTasks((prev) => {
+                const updated = { ...prev };
+                delete updated[taskId];
+                return updated;
+              });
+            }, 5000);
           }
         } catch (err) {
           console.error('Error fetching task status:', err);
         }
       }
-    }, 1000);
+    }, 2000); // Poll every 2 seconds instead of 1 to reduce load
 
     return () => clearInterval(interval);
   }, [processingTasks]);
@@ -975,22 +994,24 @@ const DocumentList = ({ onRefresh }) => {
           [response.task_id]: {
             task_id: response.task_id,
             status: 'pending',
-            message: 'Processing...',
+            message: response.message || 'Processing...',
             progress: 0,
           },
         }));
-        notify.info('Document processing started');
+        notify.success('Document upload started! Processing in background...');
       }
 
+      // Close dialog immediately and reset form - don't wait for processing
       setCreateDialogOpen(false);
       setExpandedAdvice(null);
       resetForm();
-      await fetchDocuments();
-      onRefresh();
+      setSubmitting(false);
+      
+      // Don't fetch documents here - let the polling mechanism handle it when task completes
+      // This prevents UI blocking
     } catch (err) {
       notify.error('Failed to create document: ' + (err.response?.data?.detail || err.message));
       console.error('Error creating document:', err);
-    } finally {
       setSubmitting(false);
     }
   };
