@@ -1061,7 +1061,10 @@ async def process_document_async(
             processing_status[task_id]["progress"] = 40
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            valid_chunks, quality_metrics = validate_chunk_quality(chunks)
+            # For "lines" strategy, don't filter small chunks (each line is a valid chunk regardless of size)
+            # For other strategies, use strict size validation
+            strict_min_size = strategy != "lines"
+            valid_chunks, quality_metrics = validate_chunk_quality(chunks, strict_min_size=strict_min_size)
             
             # Store quality metrics in processing status
             processing_status[task_id]["quality_metrics"] = quality_metrics
@@ -1161,16 +1164,10 @@ async def process_document_async(
                 document_name = metadata.get("name", "Unknown")
                 
                 for i, chunk in enumerate(chunks):
-                    # Create contextual chunk with document type and metadata prepended
-                    contextual_chunk = create_contextual_chunk(
-                        chunk_text=chunk,
-                        document_name=document_name,
-                        document_type=document_type,
-                        chunk_number=i + 1,
-                        total_chunks=len(chunks),
-                        metadata=metadata
-                    )
-                    contextual_chunks.append(contextual_chunk)
+                    # Store chunks directly without contextual prefix
+                    # Document metadata is already in chunk_metadata and will be used for filtering/formatting
+                    # This preserves more actual content space per chunk
+                    contextual_chunks.append(chunk)
                     
                     chunk_meta = {
                         **chroma_metadata,
@@ -1187,25 +1184,33 @@ async def process_document_async(
                     }
                     chunk_metadata.append(chunk_meta)
                 
-                # Add contextual chunks to collection (these include document type in the text)
+                # Add chunks to collection with metadata
+                # Document type and name are stored in metadata, not in chunk text
+                # This preserves more actual content space per chunk
                 collection.add(
-                    documents=contextual_chunks,  # Use contextual chunks, not raw chunks
+                    documents=contextual_chunks,  # Raw chunks without prefixes
                     metadatas=chunk_metadata,
                     ids=chunk_ids
                 )
                 
-                logger.info(f"Stored {len(contextual_chunks)} contextual chunks for document type: {document_type}")
+                logger.info(f"Stored {len(contextual_chunks)} chunks for document type: {document_type}")
             
             # Step 11: Store full document
             processing_status[task_id]["message"] = "Storing document metadata..."
             processing_status[task_id]["progress"] = 90
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
+            # Calculate content statistics
+            content_length = len(content)
+            word_count = len(content.split()) if content else 0
+            
             full_doc_metadata = {
                 **chroma_metadata,
                 "is_chunk": False,
                 "chunk_count": len(chunks),
                 "document_type": document_type,  # Ensure document type is stored
+                "content_length": content_length,  # Add character count
+                "word_count": word_count,  # Add word count
                 "updated_at": datetime.utcnow().isoformat()
             }
             
@@ -1385,6 +1390,12 @@ async def list_documents(
             
             content = all_results["documents"][i] if all_results["documents"] else ""
             
+            # Calculate content_length and word_count if not in metadata
+            if "content_length" not in metadata:
+                metadata["content_length"] = len(content)
+            if "word_count" not in metadata:
+                metadata["word_count"] = len(content.split()) if content else 0
+            
             documents.append({
                 "id": doc_id,
                 "collection_name": collection_name,
@@ -1430,6 +1441,12 @@ async def get_document(collection_name: str, document_id: str):
         
         metadata = result["metadatas"][0] if result["metadatas"] else {}
         content = result["documents"][0] if result["documents"] else ""
+        
+        # Calculate content_length and word_count if not in metadata
+        if "content_length" not in metadata:
+            metadata["content_length"] = len(content)
+        if "word_count" not in metadata:
+            metadata["word_count"] = len(content.split()) if content else 0
         
         return {
             "id": document_id,
@@ -1838,6 +1855,94 @@ async def delete_document(collection_name: str, document_id: str):
     except Exception as e:
         logger.error(f"Error deleting document: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/collections/{collection_name}/documents/{document_id}/chunks")
+async def get_document_chunks(
+    collection_name: str,
+    document_id: str,
+    skip: int = 0,
+    limit: int = 100
+):
+    """Get all chunks for a specific document with metadata"""
+    try:
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
+        
+        # Get all items from collection
+        # Note: ids are always returned, don't include them in the include parameter
+        all_results = collection.get(include=["documents", "metadatas"])
+        
+        if not all_results["ids"]:
+            logger.warning(f"No items found in collection '{collection_name}'")
+            return {
+                "chunks": [],
+                "total": 0,
+                "skip": skip,
+                "limit": limit,
+                "document_id": document_id
+            }
+        
+        # Filter chunks that belong to this document
+        chunks = []
+        for i, chunk_id in enumerate(all_results["ids"]):
+            metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
+            
+            # Check if this is a chunk belonging to the document
+            is_chunk = metadata.get("is_chunk")
+            if is_chunk is True:
+                # Check if it belongs to this document by parent_id
+                parent_id = metadata.get("parent_id")
+                
+                # Also check if chunk_id pattern matches (format: {document_id}_chunk_{index})
+                belongs_to_document = (
+                    parent_id == document_id or 
+                    chunk_id.startswith(f"{document_id}_chunk_") or
+                    chunk_id.startswith(f"{document_id}_chunk")
+                )
+                
+                if belongs_to_document:
+                    content = all_results["documents"][i] if all_results["documents"] else ""
+                    
+                    # Calculate chunk statistics
+                    chunk_length = len(content)
+                    chunk_word_count = len(content.split()) if content else 0
+                    
+                    chunks.append({
+                        "id": chunk_id,
+                        "content": content,
+                        "metadata": metadata,
+                        "chunk_number": metadata.get("chunk_number", 0),
+                        "total_chunks": metadata.get("total_chunks", 0),
+                        "chunk_index": metadata.get("chunk_index", 0),
+                        "document_type": metadata.get("document_type", "unknown"),
+                        "parent_id": parent_id,
+                        "parent_name": metadata.get("parent_name") or metadata.get("name", "Unknown"),
+                        "length": chunk_length,  # Character count for UI
+                        "word_count": chunk_word_count  # Word count for UI
+                    })
+        
+        # Sort chunks by chunk_number
+        chunks.sort(key=lambda x: x.get("chunk_number", 0))
+        
+        logger.info(f"Found {len(chunks)} chunks for document {document_id} in collection {collection_name}")
+        
+        # Apply pagination
+        total_chunks = len(chunks)
+        paginated_chunks = chunks[skip:skip+limit]
+        
+        return {
+            "chunks": paginated_chunks,
+            "total": total_chunks,
+            "skip": skip,
+            "limit": limit,
+            "document_id": document_id
+        }
+    except Exception as e:
+        logger.error(f"Error getting document chunks for {document_id} in {collection_name}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting document chunks: {str(e)}")
 
 
 # Document version endpoints

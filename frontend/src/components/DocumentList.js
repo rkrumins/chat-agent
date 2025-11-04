@@ -1410,8 +1410,15 @@ const DocumentList = ({ onRefresh }) => {
                             <br />
                           </>
                         )}
-                        Size: {doc.metadata.chunk_size != null ? Number(doc.metadata.chunk_size) : 'N/A'}, 
-                        Overlap: {doc.metadata.chunk_overlap != null ? Number(doc.metadata.chunk_overlap) : 'N/A'}
+                        {doc.metadata.chunking_strategy !== 'lines' && (
+                          <>
+                            Size: {doc.metadata.chunk_size != null ? Number(doc.metadata.chunk_size) : 'N/A'}, 
+                            Overlap: {doc.metadata.chunk_overlap != null ? Number(doc.metadata.chunk_overlap) : 'N/A'}
+                          </>
+                        )}
+                        {doc.metadata.chunking_strategy === 'lines' && (
+                          <>One chunk per line</>
+                        )}
                       </Typography>
                     </TableCell>
                     <TableCell>
