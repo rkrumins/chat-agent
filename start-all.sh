@@ -90,7 +90,7 @@ else
     fi
     
     source venv/bin/activate
-    $PYTHON_CMD -m chainlit run app.py --host 0.0.0.0 --port 8001 &
+    $PYTHON_CMD -m chainlit run rag_chatbot.py --host 0.0.0.0 --port 8001 &
     CHATBOT_PID=$!
     echo "✓ Chatbot started (PID: $CHATBOT_PID)"
     deactivate
@@ -109,7 +109,7 @@ echo "Access the application:"
 echo "  Frontend: http://localhost:3000"
 echo "  Backend:  http://localhost:8000"
 echo "  API Docs: http://localhost:8000/docs"
-echo "  Chatbot:  http://localhost:8001"
+echo "  Chatbot:  http://localhost:8001 (RAG Module with Multi-Collection Support)"
 echo ""
 echo "Press Ctrl+C to stop all services"
 echo ""

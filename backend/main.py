@@ -23,12 +23,6 @@ from utils import (
     sanitize_filename, estimate_processing_time, MAX_FILE_SIZE
 )
 
-# Import metadata extraction utilities
-from metadata_extractor import (
-    build_comprehensive_document_metadata,
-    build_comprehensive_chunk_metadata
-)
-
 # File parsing imports
 try:
     from PyPDF2 import PdfReader
@@ -92,9 +86,7 @@ class ChunkingStrategy(str, Enum):
 class DocumentMetadata(BaseModel):
     name: str
     purpose: Optional[str] = ""
-    tags: Optional[str] = ""  # Comma-separated tags
-    author: Optional[str] = None  # Document author/creator
-    source: Optional[str] = None  # Source of the document (e.g., 'confluence', 'github', 'upload')
+    tags: Optional[str] = ""  # Changed to string (comma-separated)
     custom_metadata: Optional[Dict[str, Any]] = {}
 
 
@@ -233,24 +225,9 @@ def chunk_by_lines(text: str, max_chunks: Optional[int] = None) -> List[str]:
     """
     Chunk text by lines (one line per chunk).
     Useful for structured documents, code, or line-by-line data.
-    This preserves all non-empty lines as separate chunks.
     """
-    if not text or not text.strip():
-        return []
-    
-    # Split by newlines (handles both \n and \r\n)
-    lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-    
-    # Keep all non-empty lines (strip whitespace but keep the content)
-    chunks = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped:  # Only include non-empty lines
-            chunks.append(stripped)
-    
-    # Log for debugging large documents
-    if len(chunks) > 50:
-        logger.info(f"Line-based chunking: split {len(text.split())} words into {len(chunks)} line chunks")
+    lines = text.split('\n')
+    chunks = [line.strip() for line in lines if line.strip()]
     
     if max_chunks:
         chunks = chunks[:max_chunks]
@@ -586,13 +563,10 @@ def chunk_text(
     Args:
         text: Text to chunk
         chunk_size: Target chunk size in characters (for size, sentences, semantic strategies)
-                   Not used for "lines" strategy
         overlap: Overlap size in characters or elements (default 200)
-                Not used for "lines" strategy
         strategy: Chunking strategy - "semantic", "size", "lines", "paragraphs", "sentences", "custom"
         separator: Custom separator for "custom" strategy (or override for paragraphs)
-                  Required for "custom" strategy, optional for "paragraphs" (defaults to '\n\n')
-        max_chunks: Optional limit on total number of chunks (applies to all strategies)
+        max_chunks: Optional limit on total number of chunks
     
     Returns:
         List of text chunks based on the specified strategy
@@ -603,48 +577,28 @@ def chunk_text(
     # Normalize strategy name
     strategy = strategy.lower() if strategy else "semantic"
     
-    # Ensure chunk_size and overlap are valid (sanitize if needed)
-    if chunk_size is None or chunk_size < 0:
-        chunk_size = 1000
-    if overlap is None or overlap < 0:
-        overlap = 200
-    
     # Route to appropriate chunking strategy
-    try:
-        if strategy == "lines":
-            # Lines strategy: one line per chunk, ignores chunk_size and overlap
-            return chunk_by_lines(text, max_chunks)
-        
-        elif strategy == "paragraphs":
-            # Paragraphs strategy: split by separator (default '\n\n'), respects chunk_size and overlap
-            sep = separator if separator else '\n\n'
-            return chunk_by_paragraphs(text, separator=sep, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-        
-        elif strategy == "sentences":
-            # Sentences strategy: split by sentence boundaries, respects chunk_size and overlap
-            return chunk_by_sentences(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-        
-        elif strategy == "size":
-            # Size strategy: split by character size with word boundaries, respects chunk_size and overlap
-            return chunk_by_size(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-        
-        elif strategy == "custom":
-            # Custom strategy: split by custom separator, respects chunk_size and overlap
-            if not separator or separator.strip() == "":
-                # Fallback to paragraphs if no separator provided
-                logger.warning("Custom separator strategy used without separator, falling back to paragraph separator '\\n\\n'")
-                separator = '\n\n'
-            return chunk_by_custom_separator(text, separator=separator, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-        
-        else:
-            # Default: semantic chunking (smart chunking with Mix-of-Granularity)
-            logger.info(f"Unknown strategy '{strategy}', using semantic chunking")
-            return chunk_text_semantic(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    if strategy == "lines":
+        return chunk_by_lines(text, max_chunks)
     
-    except Exception as e:
-        logger.error(f"Error in chunk_text with strategy '{strategy}': {str(e)}")
-        # Fallback to semantic chunking on error
-        logger.warning(f"Falling back to semantic chunking due to error")
+    elif strategy == "paragraphs":
+        sep = separator if separator else '\n\n'
+        return chunk_by_paragraphs(text, separator=sep, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    
+    elif strategy == "sentences":
+        return chunk_by_sentences(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    
+    elif strategy == "size":
+        return chunk_by_size(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    
+    elif strategy == "custom":
+        if not separator:
+            # Fallback to paragraphs if no separator provided
+            separator = '\n\n'
+        return chunk_by_custom_separator(text, separator=separator, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    
+    else:
+        # Default: semantic chunking (smart chunking with Mix-of-Granularity)
         return chunk_text_semantic(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
 
 
@@ -1093,11 +1047,6 @@ async def process_document_async(
             separator = metadata.get("chunk_separator") or chunk_separator
             max_chunks_param = metadata.get("max_chunks") or max_chunks
             
-            # Log chunking parameters for debugging
-            logger.info(f"Chunking with strategy='{strategy}', chunk_size={chunk_size}, "
-                       f"chunk_overlap={chunk_overlap}, separator={separator}, max_chunks={max_chunks_param}")
-            logger.info(f"Document content length: {len(content)} characters, {len(content.split())} words")
-            
             chunks = chunk_text(
                 content, 
                 chunk_size=chunk_size, 
@@ -1107,17 +1056,12 @@ async def process_document_async(
                 max_chunks=max_chunks_param
             )
             
-            logger.info(f"Initial chunking produced {len(chunks)} chunks using strategy '{strategy}'")
-            
             # Step 6: Validate chunk quality
             processing_status[task_id]["message"] = "Validating chunk quality..."
             processing_status[task_id]["progress"] = 40
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            # For line-based chunking, use more lenient validation (don't filter small chunks)
-            # because each line might be a valid definition even if short
-            use_strict_validation = strategy.lower() != "lines"
-            valid_chunks, quality_metrics = validate_chunk_quality(chunks, strict_min_size=use_strict_validation)
+            valid_chunks, quality_metrics = validate_chunk_quality(chunks)
             
             # Store quality metrics in processing status
             processing_status[task_id]["quality_metrics"] = quality_metrics
@@ -1127,20 +1071,12 @@ async def process_document_async(
                 raise ValueError("No valid chunks generated after quality validation. " + 
                                "; ".join(quality_metrics.get("issues", ["Unknown error"])))
             
-            # Warn if many chunks were filtered (but less strict for lines strategy)
+            # Warn if many chunks were filtered
             if quality_metrics["filtered_chunks"] > 0:
-                if strategy.lower() == "lines" and quality_metrics["filtered_chunks"] > len(chunks) * 0.5:
-                    # If more than 50% filtered for lines strategy, something is wrong
-                    logger.warning(f"Filtered {quality_metrics['filtered_chunks']} chunks using lines strategy. "
-                                 f"Valid chunks: {quality_metrics['valid_chunks']}/{quality_metrics['total_chunks']}")
-                elif strategy.lower() != "lines":
-                    logger.warning(f"Filtered {quality_metrics['filtered_chunks']} invalid chunks. "
-                                 f"Valid chunks: {quality_metrics['valid_chunks']}/{quality_metrics['total_chunks']}")
+                logger.warning(f"Filtered {quality_metrics['filtered_chunks']} invalid chunks. "
+                             f"Valid chunks: {quality_metrics['valid_chunks']}/{quality_metrics['total_chunks']}")
             
             chunks = valid_chunks  # Use validated chunks
-            
-            # Log chunk count for debugging
-            logger.info(f"Chunking strategy '{strategy}' produced {len(chunks)} chunks from document")
             
             processing_status[task_id]["message"] = f"Processing {len(chunks)} validated chunks..."
             processing_status[task_id]["progress"] = 50
@@ -1192,33 +1128,23 @@ async def process_document_async(
                     chunk_size = adaptive_chunk_size
                     chunk_overlap = adaptive_overlap
         
-            # Step 9: Prepare comprehensive metadata for ChromaDB
-            processing_status[task_id]["message"] = "Preparing comprehensive metadata..."
+            # Step 9: Prepare metadata for ChromaDB
+            processing_status[task_id]["message"] = "Preparing metadata..."
             processing_status[task_id]["progress"] = 70
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            # Add chunking parameters to metadata for document
-            metadata["chunk_size"] = chunk_size
-            metadata["chunk_overlap"] = chunk_overlap
-            metadata["chunking_strategy"] = strategy
-            metadata["chunk_separator"] = separator
-            metadata["max_chunks"] = max_chunks_param
-            metadata["chunk_count"] = len(chunks)
-            metadata["quality_metrics"] = quality_metrics
-            
-            # Build comprehensive document metadata following RAG best practices
-            document_metadata = build_comprehensive_document_metadata(
-                document_id=document_id,
-                name=metadata.get("name", "Unknown"),
-                metadata=metadata,
-                collection_name=collection_name,
-                document_type=document_type,
-                content=content,
-                version=version
-            )
-            
-            # Prepare for ChromaDB (convert lists/dicts to strings)
-            chroma_metadata = prepare_metadata_for_chroma(document_metadata)
+            chroma_metadata = prepare_metadata_for_chroma(metadata)
+            chroma_metadata["chunk_size"] = chunk_size
+            chroma_metadata["chunk_overlap"] = chunk_overlap
+            chroma_metadata["chunking_strategy"] = strategy  # Store chunking strategy used
+            if separator:
+                chroma_metadata["chunk_separator"] = separator
+            if max_chunks_param:
+                chroma_metadata["max_chunks"] = max_chunks_param
+            chroma_metadata["version"] = version
+            chroma_metadata["is_latest"] = True
+            chroma_metadata["document_type"] = document_type  # CRITICAL: Add document type to metadata
+            chroma_metadata["quality_metrics"] = json.dumps(quality_metrics)  # Store quality metrics
             
             # Step 10: Store chunks in vector database
             processing_status[task_id]["message"] = "Storing in vector database with contextual chunks..."
@@ -1230,115 +1156,58 @@ async def process_document_async(
             if len(chunks) >= 1:
                 chunk_ids = [f"{document_id}_chunk_{i}" for i in range(len(chunks))]
                 contextual_chunks = []
-                chunk_metadata_list = []
+                chunk_metadata = []
                 
                 document_name = metadata.get("name", "Unknown")
                 
-                # For large documents, process in batches to avoid memory issues
-                batch_size = 100  # Process 100 chunks at a time
-                total_chunks = len(chunks)
-                
-                logger.info(f"Processing {total_chunks} chunks in batches of {batch_size}")
-                
                 for i, chunk in enumerate(chunks):
-                    # Update progress for large documents
-                    if total_chunks > 50 and i % 50 == 0:
-                        progress = 80 + int((i / total_chunks) * 10)  # 80-90% range
-                        processing_status[task_id]["progress"] = progress
-                        processing_status[task_id]["message"] = f"Processing chunks {i+1}/{total_chunks}..."
-                        processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
-                    
                     # Create contextual chunk with document type and metadata prepended
                     contextual_chunk = create_contextual_chunk(
                         chunk_text=chunk,
                         document_name=document_name,
                         document_type=document_type,
                         chunk_number=i + 1,
-                        total_chunks=total_chunks,
+                        total_chunks=len(chunks),
                         metadata=metadata
                     )
                     contextual_chunks.append(contextual_chunk)
                     
-                    # Build comprehensive chunk metadata following RAG best practices
-                    # Note: For large documents, we don't pass full document_content to avoid memory issues
-                    # Only pass a small sample for page estimation
-                    previous_chunk = chunks[i - 1] if i > 0 else None
-                    content_sample = content[:5000] if len(content) > 5000 else content  # Sample for page estimation
-                    
-                    try:
-                        chunk_meta = build_comprehensive_chunk_metadata(
-                            chunk_id=chunk_ids[i],
-                            chunk_index=i,
-                            chunk_text=chunk,
-                            document_metadata=document_metadata,
-                            document_content=content_sample,  # Use sample instead of full content
-                            previous_chunk_text=previous_chunk,
-                            total_chunks=total_chunks
-                        )
-                    except Exception as e:
-                        logger.warning(f"Error building metadata for chunk {i}: {str(e)}, using minimal metadata")
-                        # Fallback to minimal metadata if extraction fails
-                        chunk_meta = {
-                            "chunk_id": chunk_ids[i],
-                            "chunk_index": i,
-                            "chunk_number": i + 1,
-                            "parent_id": document_id,
-                            "document_id": document_id,
-                            "document_name": document_name,
-                            "document_type": document_type,
-                            "total_chunks": total_chunks,
-                            "is_chunk": True,
-                            "chunk_position": f"{i + 1} of {total_chunks}"
-                        }
-                    
-                    # Prepare for ChromaDB (convert lists/dicts to strings)
-                    chunk_meta_processed = prepare_metadata_for_chroma(chunk_meta)
-                    chunk_metadata_list.append(chunk_meta_processed)
+                    chunk_meta = {
+                        **chroma_metadata,
+                        "chunk_index": i,
+                        "chunk_number": i + 1,  # Human-readable chunk number (1-indexed)
+                        "total_chunks": len(chunks),
+                        "parent_id": document_id,
+                        "parent_name": document_name,
+                        "is_chunk": True,
+                        # Ensure document name is preserved for reference
+                        "document_name": document_name,
+                        "document_version": version,
+                        "document_type": document_type,  # CRITICAL: Document type in chunk metadata
+                    }
+                    chunk_metadata.append(chunk_meta)
                 
-                # Add contextual chunks to collection in batches for large documents
-                # ChromaDB can handle large batches, but we batch to provide progress updates
-                if total_chunks > batch_size:
-                    logger.info(f"Storing {total_chunks} chunks in batches of {batch_size}")
-                    for batch_start in range(0, total_chunks, batch_size):
-                        batch_end = min(batch_start + batch_size, total_chunks)
-                        batch_ids = chunk_ids[batch_start:batch_end]
-                        batch_docs = contextual_chunks[batch_start:batch_end]
-                        batch_meta = chunk_metadata_list[batch_start:batch_end]
-                        
-                        collection.add(
-                            documents=batch_docs,
-                            metadatas=batch_meta,
-                            ids=batch_ids
-                        )
-                        
-                        # Update progress
-                        progress = 80 + int((batch_end / total_chunks) * 10)
-                        processing_status[task_id]["progress"] = progress
-                        processing_status[task_id]["message"] = f"Stored chunks {batch_start+1}-{batch_end}/{total_chunks}..."
-                        processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
-                        
-                        logger.info(f"Stored batch {batch_start//batch_size + 1}: chunks {batch_start+1}-{batch_end}")
-                else:
-                    # Single batch for smaller documents
-                    collection.add(
-                        documents=contextual_chunks,
-                        metadatas=chunk_metadata_list,
-                        ids=chunk_ids
-                    )
+                # Add contextual chunks to collection (these include document type in the text)
+                collection.add(
+                    documents=contextual_chunks,  # Use contextual chunks, not raw chunks
+                    metadatas=chunk_metadata,
+                    ids=chunk_ids
+                )
                 
-                logger.info(f"Stored {total_chunks} contextual chunks for document type: {document_type}")
+                logger.info(f"Stored {len(contextual_chunks)} contextual chunks for document type: {document_type}")
             
             # Step 11: Store full document
-            processing_status[task_id]["message"] = "Storing document with comprehensive metadata..."
+            processing_status[task_id]["message"] = "Storing document metadata..."
             processing_status[task_id]["progress"] = 90
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            # Update timestamp
-            chroma_metadata["updated_at"] = datetime.utcnow().isoformat()
-            chroma_metadata["is_chunk"] = False
-            
-            # Full document metadata is already comprehensive from build_comprehensive_document_metadata
-            full_doc_metadata = chroma_metadata
+            full_doc_metadata = {
+                **chroma_metadata,
+                "is_chunk": False,
+                "chunk_count": len(chunks),
+                "document_type": document_type,  # Ensure document type is stored
+                "updated_at": datetime.utcnow().isoformat()
+            }
             
             collection.add(
                 documents=[content],
@@ -1503,78 +1372,18 @@ async def list_documents(
         all_results = collection.get(include=["documents", "metadatas"])
         
         documents = []
-        
-        # First pass: collect all documents
-        doc_ids_to_process = []
         for i, doc_id in enumerate(all_results["ids"]):
             metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
             
-            # Skip chunks (handle both boolean and string)
-            is_chunk = metadata.get("is_chunk")
-            is_chunk_bool = is_chunk is True or str(is_chunk).lower() == "true"
-            if is_chunk_bool:
+            # Skip chunks
+            if metadata.get("is_chunk") is True:
                 continue
             
             # Skip old versions unless requested
             if not show_all_versions and metadata.get("is_latest") is False:
                 continue
             
-            doc_ids_to_process.append((doc_id, i))
-        
-        # Second pass: count chunks for each document
-        # Build a map of chunk counts by document_id
-        chunk_counts = {}
-        for i, doc_id in enumerate(all_results["ids"]):
-            metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
-            is_chunk = metadata.get("is_chunk")
-            # Handle both boolean True and string "True" cases
-            is_chunk_bool = is_chunk is True or str(is_chunk).lower() == "true"
-            if is_chunk_bool:
-                parent_id = metadata.get("parent_id") or metadata.get("document_id")
-                if parent_id:
-                    chunk_counts[parent_id] = chunk_counts.get(parent_id, 0) + 1
-        
-        # Third pass: build document list with accurate chunk counts
-        for doc_id, idx in doc_ids_to_process:
-            metadata = all_results["metadatas"][idx] if all_results["metadatas"] else {}
-            content = all_results["documents"][idx] if all_results["documents"] else ""
-            
-            # Use stored chunk_count if available, otherwise count dynamically
-            chunk_count = metadata.get("chunk_count")
-            if chunk_count is None or chunk_count == 0:
-                chunk_count = chunk_counts.get(doc_id, 0)
-            
-            # Update metadata with accurate chunk_count
-            if chunk_count > 0:
-                metadata["chunk_count"] = chunk_count
-            
-            # Ensure chunk_size and chunk_overlap are integers (ChromaDB may store as strings)
-            # Also ensure they exist - if not present, don't add defaults here (let frontend handle it)
-            if "chunk_size" in metadata and metadata["chunk_size"] is not None:
-                try:
-                    metadata["chunk_size"] = int(metadata["chunk_size"])
-                except (ValueError, TypeError):
-                    # If conversion fails, try to get from string
-                    try:
-                        metadata["chunk_size"] = int(str(metadata["chunk_size"]).strip())
-                    except (ValueError, TypeError):
-                        pass  # Keep original value if conversion fails
-            if "chunk_overlap" in metadata and metadata["chunk_overlap"] is not None:
-                try:
-                    metadata["chunk_overlap"] = int(metadata["chunk_overlap"])
-                except (ValueError, TypeError):
-                    # If conversion fails, try to get from string
-                    try:
-                        metadata["chunk_overlap"] = int(str(metadata["chunk_overlap"]).strip())
-                    except (ValueError, TypeError):
-                        pass  # Keep original value if conversion fails
-            
-            # Debug: Log if chunk_size/chunk_overlap are missing (for troubleshooting)
-            # Only log once per document to avoid spam
-            if "chunk_size" not in metadata or metadata.get("chunk_size") is None:
-                logger.debug(f"Document {doc_id} missing chunk_size in metadata")
-            if "chunk_overlap" not in metadata or metadata.get("chunk_overlap") is None:
-                logger.debug(f"Document {doc_id} missing chunk_overlap in metadata")
+            content = all_results["documents"][i] if all_results["documents"] else ""
             
             documents.append({
                 "id": doc_id,
@@ -1637,88 +1446,6 @@ async def get_document(collection_name: str, document_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/collections/{collection_name}/documents/{document_id}/chunks")
-async def get_document_chunks(collection_name: str, document_id: str, skip: int = 0, limit: int = 100):
-    """Get all chunks for a specific document with metadata"""
-    try:
-        collection = chroma_client.get_collection(
-            name=collection_name,
-            embedding_function=embedding_function
-        )
-        
-        # Get all documents to find chunks (ids are returned by default)
-        all_results = collection.get(include=["documents", "metadatas"])
-        
-        chunks = []
-        for i, doc_id in enumerate(all_results["ids"]):
-            metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
-            
-            # Check if this is a chunk belonging to the requested document
-            # Check both parent_id and document_id fields, and ensure is_chunk is True
-            parent_id = metadata.get("parent_id") or metadata.get("document_id")
-            is_chunk = metadata.get("is_chunk")
-            
-            # Handle both boolean True and string "True" cases
-            is_chunk_bool = is_chunk is True or str(is_chunk).lower() == "true"
-            
-            if parent_id == document_id and is_chunk_bool:
-                
-                content = all_results["documents"][i] if all_results["documents"] else ""
-                
-                # Clean up contextual prefixes for display
-                display_content = content
-                if "[DOCUMENT_TYPE:" in display_content:
-                    lines = display_content.split("\n\n")
-                    if len(lines) > 1:
-                        display_content = "\n\n".join(lines[1:])
-                
-                # Get chunk index and total chunks for accurate position
-                chunk_index = metadata.get("chunk_index", 0)
-                total_chunks = len(chunks) + 1  # Will be updated after we count all chunks
-                
-                chunk_data = {
-                    "id": doc_id,
-                    "chunk_index": chunk_index,
-                    "chunk_number": metadata.get("chunk_number", chunk_index + 1),
-                    "content": display_content,
-                    "raw_content": content,  # Keep original for reference
-                    "metadata": metadata,
-                    "length": len(content),
-                    "word_count": metadata.get("word_count", len(content.split())),
-                    "content_type": metadata.get("content_type", "paragraph"),
-                    "topics": metadata.get("topics", ""),
-                    "difficulty_level": metadata.get("difficulty_level", "Intermediate"),
-                    "section_title": metadata.get("section_title", ""),
-                    "chunk_position": metadata.get("chunk_position", ""),  # Will be recalculated below
-                }
-                chunks.append(chunk_data)
-        
-        # Sort by chunk index
-        chunks.sort(key=lambda x: x.get("chunk_index", 0))
-        
-        # Recalculate chunk_position with accurate total count (after we have all chunks)
-        total_chunks = len(chunks)
-        for chunk in chunks:
-            chunk_index = chunk.get("chunk_index", 0)
-            chunk["chunk_position"] = f"{chunk_index + 1} of {total_chunks}"
-        
-        # Apply pagination
-        total = len(chunks)
-        paginated_chunks = chunks[skip:skip+limit]
-        
-        return {
-            "chunks": paginated_chunks,
-            "total": total,
-            "skip": skip,
-            "limit": limit
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting document chunks: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/collections/{collection_name}/documents")
 async def create_document(
     collection_name: str,
@@ -1770,13 +1497,11 @@ async def create_document(
             "updated_at": datetime.utcnow().isoformat()
         }
         
-        # Prepare metadata with enhanced fields
+        # Prepare metadata
         metadata = {
             "name": document.metadata.name,
             "purpose": document.metadata.purpose or "",
             "tags": document.metadata.tags or "",
-            "author": document.metadata.author,
-            "source": document.metadata.source,
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
             **document.metadata.custom_metadata
@@ -1820,13 +1545,11 @@ async def upload_document(
     name: str = Form(...),
     purpose: str = Form(""),
     tags: str = Form(""),
-    author: Optional[str] = Form(None),
-    source: Optional[str] = Form(None),
     chunk_size: int = Form(1000),
     chunk_overlap: int = Form(200),
     chunking_strategy: str = Form("semantic"),
-    chunk_separator: Optional[str] = Form(None),
-    max_chunks: Optional[int] = Form(None),
+    chunk_separator: str = Form(None),
+    max_chunks: int = Form(None),
     custom_metadata: str = Form("{}"),
     create_new_version: bool = Form(False)
 ):
@@ -1896,13 +1619,11 @@ async def upload_document(
         except json.JSONDecodeError:
             custom_meta = {}
         
-        # Prepare metadata with enhanced fields
+        # Prepare metadata
         metadata = {
             "name": name,
-            "purpose": purpose or "",
-            "tags": tags or "",
-            "author": author or None,
-            "source": source or None,
+            "purpose": purpose,
+            "tags": tags,
             "filename": sanitized_filename,
             "original_filename": file.filename,
             "file_type": Path(sanitized_filename).suffix.lower(),

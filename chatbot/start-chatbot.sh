@@ -141,10 +141,17 @@ echo "📍 Chatbot URL:"
 echo "   http://localhost:8001"
 echo ""
 echo "💡 Tips:"
-echo "   - Type '/help' for available commands"
-echo "   - Type '/collections' to see collections"
+echo "   - Type '/collections' to see available collections"
+echo "   - Type '/use <collection1> [collection2] ...' to select collections"
+echo "   - Type '/info' to see configuration"
+echo "   - Query across multiple collections simultaneously!"
 echo "   - Press Ctrl+C to stop"
 echo ""
+echo "📚 This chatbot uses the new RAG module with:"
+echo "   - Multi-collection query support"
+echo "   - Backend API integration"
+echo "   - Production-ready retrieval"
+echo ""
 
-# Start the chatbot
-python -m chainlit run app.py --host 0.0.0.0 --port 8001
+# Start the chatbot (using new RAG module)
+python -m chainlit run rag_chatbot.py --host 0.0.0.0 --port 8001
