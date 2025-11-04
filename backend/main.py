@@ -1343,8 +1343,22 @@ async def create_collection(collection: CollectionCreate):
             "message": "Collection created successfully"
         }
     except Exception as e:
-        logger.error(f"Error creating collection: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        error_msg = str(e)
+        logger.error(f"Error creating collection: {error_msg}")
+        
+        # Provide user-friendly error message for validation errors
+        if "Validation error" in error_msg or "Expected a name" in error_msg:
+            user_friendly_msg = (
+                "Invalid collection name. Collection names must:\n"
+                "• Be 3-512 characters long\n"
+                "• Contain only letters, numbers, dots (.), underscores (_), and hyphens (-)\n"
+                "• Start and end with a letter or number\n"
+                "• Not contain spaces\n\n"
+                f"Example: Use 'software-engineering' or 'software_engineering' instead of '{collection.name}'"
+            )
+            raise HTTPException(status_code=400, detail=user_friendly_msg)
+        
+        raise HTTPException(status_code=400, detail=error_msg)
 
 
 @app.delete("/collections/{collection_name}")
