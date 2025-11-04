@@ -91,9 +91,15 @@ def validate_chunking_parameters(chunk_size: int, chunk_overlap: int,
     return True, None
 
 
-def validate_chunk_quality(chunks: List[str]) -> Tuple[List[str], Dict[str, Any]]:
+def validate_chunk_quality(chunks: List[str], strict_min_size: bool = True) -> Tuple[List[str], Dict[str, Any]]:
     """
     Validate chunk quality and filter out invalid chunks.
+    
+    Args:
+        chunks: List of text chunks to validate
+        strict_min_size: If True, filter chunks smaller than MIN_CHUNK_SIZE.
+                        If False, only filter empty chunks (useful for line-based chunking).
+    
     Returns: (valid_chunks, quality_metrics)
     """
     valid_chunks = []
@@ -119,27 +125,28 @@ def validate_chunk_quality(chunks: List[str]) -> Tuple[List[str], Dict[str, Any]
         chunk = chunk.strip()
         chunk_length = len(chunk)
         
-        # Check for empty chunks
+        # Check for empty chunks (always filter these)
         if chunk_length == 0:
             quality_metrics["empty_chunks"] += 1
             quality_metrics["filtered_chunks"] += 1
             quality_metrics["issues"].append(f"Chunk {i+1} is empty")
             continue
         
-        # Check for chunks that are too small (likely fragmented or invalid)
-        if chunk_length < MIN_CHUNK_SIZE:
-            quality_metrics["too_small_chunks"] += 1
-            quality_metrics["filtered_chunks"] += 1
-            quality_metrics["issues"].append(f"Chunk {i+1} is too small ({chunk_length} chars, minimum {MIN_CHUNK_SIZE})")
-            continue
-        
-        # Check if chunk is mostly whitespace
-        non_whitespace = len(chunk) - len(chunk.replace(' ', '').replace('\n', '').replace('\t', ''))
-        if non_whitespace < MIN_CHUNK_SIZE:
-            quality_metrics["too_small_chunks"] += 1
-            quality_metrics["filtered_chunks"] += 1
-            quality_metrics["issues"].append(f"Chunk {i+1} contains mostly whitespace")
-            continue
+        # Check for chunks that are too small (only if strict_min_size is True)
+        if strict_min_size:
+            if chunk_length < MIN_CHUNK_SIZE:
+                quality_metrics["too_small_chunks"] += 1
+                quality_metrics["filtered_chunks"] += 1
+                quality_metrics["issues"].append(f"Chunk {i+1} is too small ({chunk_length} chars, minimum {MIN_CHUNK_SIZE})")
+                continue
+            
+            # Check if chunk is mostly whitespace (only if strict_min_size is True)
+            non_whitespace = len(chunk) - len(chunk.replace(' ', '').replace('\n', '').replace('\t', ''))
+            if non_whitespace < MIN_CHUNK_SIZE:
+                quality_metrics["too_small_chunks"] += 1
+                quality_metrics["filtered_chunks"] += 1
+                quality_metrics["issues"].append(f"Chunk {i+1} contains mostly whitespace")
+                continue
         
         # Valid chunk
         valid_chunks.append(chunk)
