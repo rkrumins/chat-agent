@@ -586,10 +586,13 @@ def chunk_text(
     Args:
         text: Text to chunk
         chunk_size: Target chunk size in characters (for size, sentences, semantic strategies)
+                   Not used for "lines" strategy
         overlap: Overlap size in characters or elements (default 200)
+                Not used for "lines" strategy
         strategy: Chunking strategy - "semantic", "size", "lines", "paragraphs", "sentences", "custom"
         separator: Custom separator for "custom" strategy (or override for paragraphs)
-        max_chunks: Optional limit on total number of chunks
+                  Required for "custom" strategy, optional for "paragraphs" (defaults to '\n\n')
+        max_chunks: Optional limit on total number of chunks (applies to all strategies)
     
     Returns:
         List of text chunks based on the specified strategy
@@ -600,28 +603,48 @@ def chunk_text(
     # Normalize strategy name
     strategy = strategy.lower() if strategy else "semantic"
     
+    # Ensure chunk_size and overlap are valid (sanitize if needed)
+    if chunk_size is None or chunk_size < 0:
+        chunk_size = 1000
+    if overlap is None or overlap < 0:
+        overlap = 200
+    
     # Route to appropriate chunking strategy
-    if strategy == "lines":
-        return chunk_by_lines(text, max_chunks)
+    try:
+        if strategy == "lines":
+            # Lines strategy: one line per chunk, ignores chunk_size and overlap
+            return chunk_by_lines(text, max_chunks)
+        
+        elif strategy == "paragraphs":
+            # Paragraphs strategy: split by separator (default '\n\n'), respects chunk_size and overlap
+            sep = separator if separator else '\n\n'
+            return chunk_by_paragraphs(text, separator=sep, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+        
+        elif strategy == "sentences":
+            # Sentences strategy: split by sentence boundaries, respects chunk_size and overlap
+            return chunk_by_sentences(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+        
+        elif strategy == "size":
+            # Size strategy: split by character size with word boundaries, respects chunk_size and overlap
+            return chunk_by_size(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+        
+        elif strategy == "custom":
+            # Custom strategy: split by custom separator, respects chunk_size and overlap
+            if not separator or separator.strip() == "":
+                # Fallback to paragraphs if no separator provided
+                logger.warning("Custom separator strategy used without separator, falling back to paragraph separator '\\n\\n'")
+                separator = '\n\n'
+            return chunk_by_custom_separator(text, separator=separator, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+        
+        else:
+            # Default: semantic chunking (smart chunking with Mix-of-Granularity)
+            logger.info(f"Unknown strategy '{strategy}', using semantic chunking")
+            return chunk_text_semantic(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
     
-    elif strategy == "paragraphs":
-        sep = separator if separator else '\n\n'
-        return chunk_by_paragraphs(text, separator=sep, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-    
-    elif strategy == "sentences":
-        return chunk_by_sentences(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-    
-    elif strategy == "size":
-        return chunk_by_size(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-    
-    elif strategy == "custom":
-        if not separator:
-            # Fallback to paragraphs if no separator provided
-            separator = '\n\n'
-        return chunk_by_custom_separator(text, separator=separator, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-    
-    else:
-        # Default: semantic chunking (smart chunking with Mix-of-Granularity)
+    except Exception as e:
+        logger.error(f"Error in chunk_text with strategy '{strategy}': {str(e)}")
+        # Fallback to semantic chunking on error
+        logger.warning(f"Falling back to semantic chunking due to error")
         return chunk_text_semantic(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
 
 

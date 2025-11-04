@@ -68,23 +68,38 @@ def validate_content(content: str) -> Tuple[bool, Optional[str], Optional[str]]:
 
 def validate_chunking_parameters(chunk_size: int, chunk_overlap: int, 
                                  chunking_strategy: str, max_chunks: Optional[int] = None) -> Tuple[bool, Optional[str]]:
-    """Validate chunking parameters"""
-    if chunk_size < MIN_CHUNK_SIZE:
-        return False, f"Chunk size ({chunk_size}) is too small (minimum {MIN_CHUNK_SIZE} characters)"
-    
-    if chunk_size > MAX_CHUNK_SIZE:
-        return False, f"Chunk size ({chunk_size}) is too large (maximum {MAX_CHUNK_SIZE} characters)"
-    
-    if chunk_overlap < 0:
-        return False, "Chunk overlap cannot be negative"
-    
-    if chunk_overlap >= chunk_size:
-        return False, f"Chunk overlap ({chunk_overlap}) must be less than chunk size ({chunk_size})"
+    """
+    Validate chunking parameters based on the selected strategy.
+    Some strategies (like "lines") don't use chunk_size or overlap, so validation is more lenient.
+    """
+    strategy = chunking_strategy.lower() if chunking_strategy else "semantic"
     
     valid_strategies = ["semantic", "size", "lines", "paragraphs", "sentences", "custom"]
-    if chunking_strategy.lower() not in valid_strategies:
+    if strategy not in valid_strategies:
         return False, f"Invalid chunking strategy '{chunking_strategy}'. Valid options: {', '.join(valid_strategies)}"
     
+    # For "lines" strategy, chunk_size and overlap are not used, so validation is lenient
+    if strategy == "lines":
+        # Only check that chunk_size and overlap are non-negative (for logging/metadata purposes)
+        if chunk_size < 0:
+            return False, f"Chunk size ({chunk_size}) cannot be negative"
+        if chunk_overlap < 0:
+            return False, "Chunk overlap cannot be negative"
+    else:
+        # For other strategies, chunk_size and overlap are used, so validate them strictly
+        if chunk_size < MIN_CHUNK_SIZE:
+            return False, f"Chunk size ({chunk_size}) is too small (minimum {MIN_CHUNK_SIZE} characters)"
+        
+        if chunk_size > MAX_CHUNK_SIZE:
+            return False, f"Chunk size ({chunk_size}) is too large (maximum {MAX_CHUNK_SIZE} characters)"
+        
+        if chunk_overlap < 0:
+            return False, "Chunk overlap cannot be negative"
+        
+        if chunk_overlap >= chunk_size:
+            return False, f"Chunk overlap ({chunk_overlap}) must be less than chunk size ({chunk_size})"
+    
+    # Validate max_chunks for all strategies
     if max_chunks is not None and max_chunks <= 0:
         return False, "max_chunks must be a positive integer"
     
