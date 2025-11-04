@@ -302,91 +302,136 @@ async def main(message: cl.Message):
         # Format response with sources
         response_text = ""
         
-        # Add follow-up indicator if detected
+        # Add follow-up indicator if detected (subtle, friendly)
         if rag_response.is_followup:
-            response_text += "💬 *Detected follow-up question - using conversation context*\n\n"
+            response_text += "💬 *I'm using context from our previous conversation to better understand your question.*\n\n"
         
+        # Main answer
         response_text += f"{rag_response.answer}\n\n"
         
-        # Add sources section
+        # Add confidence indicator (subtle, at the end)
+        if rag_response.confidence_score is not None:
+            confidence_pct = int(rag_response.confidence_score * 100)
+            if confidence_pct >= 80:
+                confidence_note = "high confidence"
+                confidence_emoji = "🟢"
+            elif confidence_pct >= 60:
+                confidence_note = "moderate confidence"
+                confidence_emoji = "🟡"
+            else:
+                confidence_note = "lower confidence - some information may be incomplete"
+                confidence_emoji = "🔴"
+            response_text += f"---\n\n{confidence_emoji} *Confidence: {confidence_pct}%* ({confidence_note})\n\n"
+        
+        # Add sources section (cleaner, more user-friendly)
         if rag_response.sources:
-            response_text += "---\n\n**📚 Sources:**\n\n"
+            response_text += "**📚 Sources used:**\n\n"
             
-            # Group sources by collection
-            sources_by_collection = {}
+            # Group sources by document (not collection) for better readability
+            doc_sources = {}
             for source in rag_response.sources:
-                collection = source.collection
-                if collection not in sources_by_collection:
-                    sources_by_collection[collection] = []
-                sources_by_collection[collection].append(source)
+                doc_key = f"{source.document_name}_{source.collection}"
+                if doc_key not in doc_sources:
+                    doc_sources[doc_key] = {
+                        'document_name': source.document_name,
+                        'collection': source.collection,
+                        'version': source.metadata.get("version", ""),
+                        'similarity': source.similarity_score,
+                        'snippet': source.content[:250].strip()  # Slightly longer snippet
+                    }
             
-            # Display sources grouped by collection
-            source_num = 1
-            for collection, sources in sources_by_collection.items():
-                response_text += f"**Collection: {collection}**\n\n"
+            # Display unique documents (sorted by relevance)
+            sorted_docs = sorted(doc_sources.items(), key=lambda x: x[1]['similarity'], reverse=True)
+            
+            for i, (doc_key, doc_info) in enumerate(sorted_docs[:5], 1):  # Show top 5 documents
+                version_str = f" (v{doc_info['version']})" if doc_info['version'] else ""
+                collection_note = f" from *{doc_info['collection']}*" if len(rag_response.collections_searched) > 1 else ""
                 
-                # Track unique documents to avoid duplicates
-                seen_docs = set()
-                for source in sources[:5]:  # Show top 5 per collection
-                    doc_key = f"{source.document_name}_{source.collection}"
-                    if doc_key in seen_docs:
-                        continue
-                    seen_docs.add(doc_key)
-                    
-                    version = source.metadata.get("version", "")
-                    version_str = f" (v{version})" if version else ""
-                    
-                    response_text += f"{source_num}. **{source.document_name}**{version_str}"
-                    if source.similarity_score > 0:
-                        response_text += f" (Relevance: {source.similarity_score:.2f})"
-                    response_text += "\n"
-                    
-                    # Add snippet
-                    snippet = source.content[:200].strip()
-                    if len(source.content) > 200:
-                        snippet += "..."
-                    response_text += f"   > {snippet}\n\n"
-                    source_num += 1
+                response_text += f"{i}. **{doc_info['document_name']}**{version_str}{collection_note}\n"
+                
+                # Add snippet if meaningful
+                snippet = doc_info['snippet']
+                if len(snippet) > 50:  # Only show if substantial
+                    # Clean up snippet - remove metadata prefixes
+                    lines = snippet.split('\n')
+                    clean_lines = [l for l in lines if not l.strip().startswith('[') or 'DOCUMENT' not in l.upper()]
+                    snippet = '\n'.join(clean_lines[:3])[:200]  # First 3 lines, max 200 chars
+                    if snippet.strip():
+                        response_text += f"   *\"{snippet}"
+                        if len(doc_info['snippet']) > 200:
+                            response_text += "...\"*\n"
+                        else:
+                            response_text += "\"*\n"
                 
                 response_text += "\n"
         
-        # Add collection info
-        if rag_response.collections_searched:
-            collections_text = ", ".join(rag_response.collections_searched)
-            response_text += f"**Searched collections:** {collections_text}\n"
-            response_text += f"**Total results found:** {rag_response.total_results}\n"
+        # Add brief summary footer (only if multiple collections or sources)
+        if len(rag_response.collections_searched) > 1 or rag_response.total_results > 5:
+            response_text += "---\n"
+            if len(rag_response.collections_searched) > 1:
+                collections_text = ", ".join(rag_response.collections_searched[:3])
+                if len(rag_response.collections_searched) > 3:
+                    collections_text += f", and {len(rag_response.collections_searched) - 3} more"
+                response_text += f"\n*Searched {len(rag_response.collections_searched)} collection(s): {collections_text}*"
+            if rag_response.total_results > 5:
+                response_text += f"\n*Found {rag_response.total_results} relevant result(s) across your documents*"
         
         # Update thinking message with response
         thinking_msg.content = response_text
         await thinking_msg.update()
         
     except Exception as e:
-        error_msg = f"""❌ **Error processing your question**
-
-**Error:** {str(e)}"""
-
-        # Check for token limit errors specifically
+        # Friendly error handling
         error_str = str(e).lower()
+        
+        # Check for token limit errors specifically
         if "length" in error_str or "token" in error_str or "400" in error_str:
-            error_msg += """
+            error_msg = """⚠️ **I encountered an issue with the response length**
 
-**This error is likely due to too much context being sent to the LLM.**
+It looks like there's too much information to process at once. Here's what you can try:
 
-**Solutions:**
-- Use `/clear` to clear conversation history
-- Try a more specific question (fewer documents will be retrieved)
+**Quick fixes:**
+- Use `/clear` to clear our conversation history
+- Ask a more specific question (this will retrieve fewer documents)
 - Break your question into smaller parts
-- The system will automatically reduce context size in future queries"""
-        else:
-            error_msg += """
 
-Please try:
+The system will automatically try to reduce context size in future queries."""
+        elif "timeout" in error_str or "timed out" in error_str:
+            error_msg = """⏱️ **The request took too long to process**
+
+This might happen if:
+- Your question is very complex
+- There are many documents to search through
+- The backend is temporarily busy
+
+**What you can do:**
+- Try asking a simpler or more specific question
+- Wait a moment and try again
+- Check if the backend service is running properly"""
+        elif "not found" in error_str or "404" in error_str:
+            error_msg = """🔍 **I couldn't find the information you're looking for**
+
+**Possible reasons:**
+- The documents might not contain information about this topic
+- Your question might need to be rephrased
+- The relevant documents might be in a different collection
+
+**Try:**
+- Rephrasing your question using different keywords
+- Using `/collections` to see available collections
+- Being more specific about what you're looking for"""
+        else:
+            error_msg = f"""😕 **I encountered an error while processing your question**
+
+**Error details:** {str(e)[:200]}
+
+**What you can try:**
 - Rephrasing your question
 - Checking if relevant documents are in the collections
-- Verifying backend API is running
-- Using `/collections` to see available collections"""
+- Using `/collections` to see available collections
+- Verifying the backend API is running
 
-        error_msg += "\n\nCheck logs for detailed error information."
+If the problem persists, check the logs for more detailed information."""
         
         thinking_msg.content = error_msg
         await thinking_msg.update()

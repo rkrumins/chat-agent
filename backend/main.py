@@ -54,8 +54,9 @@ chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
 # Initialize embedding function (MUST match chatbot's embedding model!)
 # Using sentence-transformers model that chatbot uses
+# Upgraded to all-mpnet-base-v2 for better accuracy (768 dimensions vs 384)
 embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+    model_name="sentence-transformers/all-mpnet-base-v2"
 )
 
 # In-memory storage for processing status
@@ -2019,16 +2020,84 @@ async def search_documents(
 ):
     """Search for similar documents in a collection"""
     try:
-        collection = chroma_client.get_collection(
-            name=collection_name,
-            embedding_function=embedding_function
-        )
+        # Try to get collection with current embedding function first
+        try:
+            collection = chroma_client.get_collection(
+                name=collection_name,
+                embedding_function=embedding_function
+            )
+            # Collection uses current embedding function - can query directly
+            query_embedding_func = embedding_function
+        except Exception as e:
+            # If that fails, try to get collection without embedding function
+            # This might be an old collection with different embedding dimensions
+            try:
+                collection = chroma_client.get_collection(name=collection_name)
+                
+                # Check the collection's embedding dimension
+                # Get a sample to check dimension
+                sample = collection.get(limit=1, include=["embeddings"])
+                if sample["ids"] and sample["embeddings"]:
+                    existing_dim = len(sample["embeddings"][0])
+                    current_dim = len(embedding_function(["test"])[0]) if embedding_function else 768
+                    
+                    if existing_dim != current_dim:
+                        logger.warning(
+                            f"Collection '{collection_name}' has embedding dimension {existing_dim}, "
+                            f"but current model uses {current_dim}. This collection may need to be migrated."
+                        )
+                        # For old collections, we can't query with the new embedding function
+                        # Return empty results with a helpful message
+                        return {
+                            "query": query,
+                            "results": [],
+                            "count": 0,
+                            "warning": f"Collection uses different embedding model (dimension {existing_dim}). "
+                                     f"Please re-upload documents to this collection to use the new embedding model."
+                        }
+                
+                # Collection exists but might have issues - try to query anyway
+                query_embedding_func = None  # Use collection's default
+            except Exception as e2:
+                logger.error(f"Collection '{collection_name}' not found or inaccessible: {str(e2)}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Collection '{collection_name}' not found or inaccessible: {str(e2)}"
+                )
         
-        results = collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"]
-        )
+        # Perform the search query
+        try:
+            if query_embedding_func:
+                # Use the current embedding function
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances"]
+                )
+            else:
+                # Collection doesn't match current embedding function
+                # Try to query without specifying embedding function (uses collection's default)
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances"]
+                )
+        except Exception as query_error:
+            error_msg = str(query_error)
+            if "dimension" in error_msg.lower() or "embedding" in error_msg.lower():
+                logger.error(
+                    f"Embedding dimension mismatch for collection '{collection_name}': {error_msg}"
+                )
+                return {
+                    "query": query,
+                    "results": [],
+                    "count": 0,
+                    "warning": f"This collection uses a different embedding model. "
+                             f"Please re-upload documents to migrate to the current model."
+                }
+            else:
+                # Re-raise other query errors
+                raise
         
         search_results = []
         if results["ids"] and results["ids"][0]:
@@ -2045,8 +2114,117 @@ async def search_documents(
             "results": search_results,
             "count": len(search_results)
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error searching documents: {str(e)}")
+        logger.error(f"Error searching documents in collection '{collection_name}': {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error searching documents: {str(e)}")
+
+
+# Migration endpoints
+
+@app.post("/migrate/embeddings")
+async def migrate_embeddings(backup_old: bool = True, delete_old: bool = False):
+    """
+    Migrate all collections from old embedding model to new one.
+    
+    Args:
+        backup_old: Whether to keep old collections (with _old suffix)
+        delete_old: Whether to delete old collections after migration (requires backup_old=True)
+    
+    Returns:
+        Migration results and statistics
+    """
+    try:
+        from migrate_embeddings import migrate_all_collections
+        
+        logger.info("Starting embedding migration...")
+        
+        results = migrate_all_collections(
+            chroma_db_path="./chroma_db",
+            backup_old=backup_old,
+            delete_old=delete_old
+        )
+        
+        return {
+            "status": "completed",
+            "message": "Migration completed successfully",
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Error during migration: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+
+
+@app.get("/migrate/status")
+async def get_migration_status():
+    """
+    Check which collections need migration
+    """
+    try:
+        old_embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        
+        collections = chroma_client.list_collections()
+        
+        needs_migration = []
+        already_migrated = []
+        unknown = []
+        
+        for collection in collections:
+            try:
+                # Try to get collection
+                col = chroma_client.get_collection(name=collection.name)
+                
+                # Check dimension
+                sample = col.get(limit=1, include=["embeddings"])
+                if sample["ids"] and sample["embeddings"]:
+                    dim = len(sample["embeddings"][0])
+                    
+                    if dim == 384:
+                        needs_migration.append({
+                            "name": collection.name,
+                            "dimension": dim,
+                            "model": "all-MiniLM-L6-v2 (old)"
+                        })
+                    elif dim == 768:
+                        already_migrated.append({
+                            "name": collection.name,
+                            "dimension": dim,
+                            "model": "all-mpnet-base-v2 (new)"
+                        })
+                    else:
+                        unknown.append({
+                            "name": collection.name,
+                            "dimension": dim,
+                            "model": "unknown"
+                        })
+                else:
+                    unknown.append({
+                        "name": collection.name,
+                        "dimension": 0,
+                        "model": "empty collection"
+                    })
+            except Exception as e:
+                unknown.append({
+                    "name": collection.name,
+                    "error": str(e)
+                })
+        
+        return {
+            "needs_migration": needs_migration,
+            "already_migrated": already_migrated,
+            "unknown": unknown,
+            "summary": {
+                "total": len(collections),
+                "needs_migration": len(needs_migration),
+                "already_migrated": len(already_migrated),
+                "unknown": len(unknown)
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error checking migration status: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

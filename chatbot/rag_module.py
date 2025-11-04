@@ -60,6 +60,7 @@ class RAGResponse:
     total_results: int
     is_followup: bool = False
     expanded_query: str = None
+    confidence_score: float = None  # Confidence score (0.0-1.0)
 
 
 class VectorDBClient:
@@ -131,6 +132,17 @@ class VectorDBClient:
             if e.response.status_code == 404:
                 logger.warning(f"Collection '{collection_name}' not found")
                 return []
+            elif e.response.status_code == 500:
+                # Check if it's an embedding dimension mismatch
+                try:
+                    error_data = e.response.json()
+                    if "warning" in error_data:
+                        logger.warning(
+                            f"Collection '{collection_name}' has embedding dimension mismatch: {error_data.get('warning')}"
+                        )
+                        return []  # Return empty results instead of failing
+                except:
+                    pass
             raise
         except Exception as e:
             logger.error(f"Error searching collection '{collection_name}': {str(e)}")
@@ -447,15 +459,15 @@ class RAGEngine:
                 if total_chunks > 1:
                     position_score = 1.0 - (chunk_num / total_chunks) * 0.5  # Earlier chunks get higher score
             
-            # Combine all factors with weights
+            # Combine all factors with optimized weights (increased base similarity and phrase importance)
             final_score = (
-                base_score * 0.30 +           # Base similarity (30%)
-                term_frequency * 0.20 +       # Term frequency (20%)
-                phrase_score * 0.15 +         # Phrase matches (15%)
-                doc_name_score * 0.10 +       # Document name (10%)
-                metadata_score * 0.10 +       # Metadata (10%)
-                quality_score * 0.10 +        # Content quality (10%)
-                position_score * 0.05         # Position (5%)
+                base_score * 0.40 +           # Base similarity (40% - increased from 30%)
+                term_frequency * 0.25 +       # Term frequency (25% - increased from 20%)
+                phrase_score * 0.20 +         # Phrase matches (20% - increased from 15%)
+                doc_name_score * 0.08 +       # Document name (8% - decreased from 10%)
+                metadata_score * 0.04 +       # Metadata (4% - decreased from 10%)
+                quality_score * 0.02 +        # Content quality (2% - decreased from 10%)
+                position_score * 0.01         # Position (1% - decreased from 5%)
             )
             
             return final_score
@@ -534,6 +546,63 @@ class RAGEngine:
         This is a conservative estimate for English text
         """
         return len(text) // 4
+    
+    def _calculate_confidence_score(
+        self,
+        results: List[RetrievalResult],
+        answer: str
+    ) -> float:
+        """
+        Calculate confidence score for the answer based on:
+        - Average similarity of sources
+        - Number of sources
+        - Answer length and completeness
+        
+        Args:
+            results: List of retrieval results used
+            answer: Generated answer text
+            
+        Returns:
+            Confidence score (0.0-1.0)
+        """
+        if not results:
+            return 0.0
+        
+        # Factor 1: Average similarity of sources (0.0-1.0)
+        avg_similarity = sum(r.similarity_score for r in results) / len(results)
+        
+        # Factor 2: Number of sources (more sources = higher confidence, up to 5)
+        source_count_score = min(len(results) / 5.0, 1.0)
+        
+        # Factor 3: Answer quality indicators
+        answer_length = len(answer.split()) if answer else 0
+        answer_length_score = min(answer_length / 100.0, 1.0)  # Normalize to 100 words
+        
+        # Check if answer contains citations/evidence (indicates grounding)
+        has_citations = any(
+            indicator in answer.lower() 
+            for indicator in ['according to', 'from', 'document', 'source', 'cited', 'reference']
+        )
+        citation_score = 0.3 if has_citations else 0.0
+        
+        # Check if answer indicates uncertainty (reduces confidence)
+        uncertainty_indicators = ['uncertain', 'unclear', 'unknown', 'missing', 'not provided', 'not found']
+        has_uncertainty = any(indicator in answer.lower() for indicator in uncertainty_indicators)
+        uncertainty_penalty = -0.2 if has_uncertainty else 0.0
+        
+        # Weighted combination
+        confidence = (
+            avg_similarity * 0.5 +           # Average similarity (50%)
+            source_count_score * 0.25 +      # Number of sources (25%)
+            answer_length_score * 0.15 +     # Answer length (15%)
+            citation_score +                 # Citations (0-30%)
+            uncertainty_penalty              # Uncertainty penalty (0 to -20%)
+        )
+        
+        # Clamp to [0.0, 1.0]
+        confidence = max(0.0, min(1.0, confidence))
+        
+        return confidence
     
     def _format_context(
         self,
@@ -709,10 +778,88 @@ Rewritten query for better retrieval:"""
             logger.warning(f"Query rewrite failed: {str(e)}, using original")
             return query
     
+    def _normalize_query(self, query: str) -> str:
+        """
+        Normalize query for better retrieval consistency
+        - Lowercase
+        - Remove extra whitespace
+        - Expand common contractions
+        - Remove special characters (keep alphanumeric + spaces)
+        """
+        # Lowercase
+        normalized = query.lower()
+        
+        # Expand common contractions
+        contractions = {
+            "don't": "do not",
+            "won't": "will not",
+            "can't": "cannot",
+            "it's": "it is",
+            "that's": "that is",
+            "what's": "what is",
+            "who's": "who is",
+            "where's": "where is",
+            "how's": "how is",
+            "there's": "there is",
+            "here's": "here is",
+            "let's": "let us",
+            "i'm": "i am",
+            "you're": "you are",
+            "he's": "he is",
+            "she's": "she is",
+            "we're": "we are",
+            "they're": "they are",
+            "i've": "i have",
+            "you've": "you have",
+            "we've": "we have",
+            "they've": "they have",
+            "i'd": "i would",
+            "you'd": "you would",
+            "he'd": "he would",
+            "she'd": "she would",
+            "we'd": "we would",
+            "they'd": "they would",
+            "i'll": "i will",
+            "you'll": "you will",
+            "he'll": "he will",
+            "she'll": "she will",
+            "we'll": "we will",
+            "they'll": "they will",
+            "isn't": "is not",
+            "aren't": "are not",
+            "wasn't": "was not",
+            "weren't": "were not",
+            "hasn't": "has not",
+            "haven't": "have not",
+            "hadn't": "had not",
+            "doesn't": "does not",
+            "didn't": "did not",
+            "wouldn't": "would not",
+            "shouldn't": "should not",
+            "couldn't": "could not",
+            "mustn't": "must not",
+            "mightn't": "might not"
+        }
+        
+        for contraction, expansion in contractions.items():
+            normalized = normalized.replace(contraction, expansion)
+        
+        # Remove special characters (keep alphanumeric, spaces, and basic punctuation)
+        import re
+        normalized = re.sub(r'[^\w\s\-\.\,\?\!]', ' ', normalized)
+        
+        # Remove extra whitespace
+        normalized = " ".join(normalized.split())
+        
+        return normalized.strip()
+    
     def _simple_query_expansion(self, query: str) -> str:
         """
         Simple query expansion without LLM - adds common synonyms and terms
         """
+        # Normalize query first
+        query = self._normalize_query(query)
+        
         # Extract key terms
         words = query.lower().split()
         
@@ -900,11 +1047,14 @@ Variations:"""
         Returns:
             Tuple of (retrieval_results, collections_searched)
         """
+        # Step 0: Normalize query (always do this for consistency)
+        normalized_query = self._normalize_query(query)
+        
         # Step 1: Rewrite query for better retrieval (if enabled)
         if not self.enable_query_rewriting:
-            rewritten_query = query
+            rewritten_query = normalized_query
         else:
-            rewritten_query = await self._rewrite_query_for_retrieval(query)
+            rewritten_query = await self._rewrite_query_for_retrieval(normalized_query)
         
         # Step 2: Expand query with conversation context if enabled
         if use_conversation_context and self.enable_conversation:
@@ -1022,24 +1172,47 @@ Variations:"""
                 from langchain_core.output_parsers import StrOutputParser
                 
                 if system_prompt is None:
-                    system_prompt = """You are an expert assistant that provides accurate, detailed answers based on the given context from documents.
+                    system_prompt = """You are a helpful and knowledgeable assistant. Your goal is to provide clear, accurate, and user-friendly answers based on the documents provided.
 
-Your responses must:
-1. Be based ONLY on the information provided in the context
-2. Quote specific sections from the context to support your answers
-3. Cite the document name and collection when referencing information (e.g., "According to [Document 1: filename.pdf] in the [collection] collection...")
-4. If the context doesn't fully answer the question, clearly state what information is missing
-5. If you're uncertain, say so rather than guessing
-6. Be specific and detailed - avoid vague or generic responses
-7. If multiple documents contain relevant information, synthesize the information coherently
-8. When information comes from multiple collections, note which collection each piece of information comes from
+**Guidelines for your responses:**
+
+1. **Be conversational and friendly**: Write as if you're explaining to a friend. Use clear, natural language.
+
+2. **Be accurate and honest**: 
+   - Base your answer ONLY on the information provided in the context
+   - If information is missing or unclear, say so directly
+   - If you're uncertain, acknowledge it rather than guessing
+
+3. **Structure your answers well**:
+   - Start with a brief, direct answer if the question is simple
+   - Use headings, bullet points, or numbered lists for complex answers
+   - Break down complex topics into digestible sections
+
+4. **Cite your sources naturally**:
+   - When referencing information, mention the document name naturally (e.g., "According to 'Atomic Habits'..." or "As mentioned in 'Clean Code'...")
+   - Don't use formal citation formats like [Document 1] - use the actual document names
+
+5. **Synthesize information**:
+   - When multiple documents discuss the same topic, combine insights naturally
+   - Compare different perspectives when relevant
+   - Highlight agreements and differences clearly
+
+6. **Be helpful**:
+   - If the question is partially answered, explain what you found and what's missing
+   - Suggest related topics that might be helpful
+   - Use examples from the context to illustrate points
+
+7. **Be concise but thorough**:
+   - Answer the question completely
+   - Avoid unnecessary repetition
+   - Include relevant details that add value
 
 CONTEXT FROM DOCUMENTS:
 {context}
 
 QUESTION: {question}
 
-Provide a comprehensive answer based on the context above. Include citations to document names and collections where applicable."""
+Provide a clear, helpful, and well-structured answer based on the context above. Be conversational and cite document names naturally when referencing information."""
                 
                 # Get conversation context if available (truncated more aggressively)
                 conversation_context_str = ""
@@ -1103,62 +1276,55 @@ Provide a comprehensive answer based on the context above. Include citations to 
                             conversation_context_str = "\n\nCONVERSATION CONTEXT:\n" + "\n".join(conv_parts) + "\n"
                 
                 if system_prompt is None:
-                    system_prompt = """You are an expert research assistant with exceptional ability to analyze, synthesize, and connect information across multiple documents. Your expertise lies in:
+                    system_prompt = """You are a helpful and knowledgeable assistant. Your goal is to provide clear, accurate, and user-friendly answers based on the documents provided.
 
-1. **Accurate Information Extraction**: Extract precise, factual information from the provided context
-2. **Cross-Document Synthesis**: Identify relationships, patterns, and connections between concepts from different documents
-3. **Critical Analysis**: Compare and contrast different perspectives, methodologies, and approaches
-4. **Clear Communication**: Present complex information in a structured, easy-to-understand manner
+**Your approach:**
 
-**Answer Guidelines:**
+**Be conversational and friendly:**
+- Write as if explaining to a friend or colleague
+- Use natural, clear language
+- Avoid overly formal or academic tone
+- Be warm and approachable
 
-**Accuracy & Evidence:**
+**Be accurate and honest:**
 - Base your answer ONLY on the information provided in the context
-- Quote specific sections verbatim when making key points (use quotation marks)
-- Cite the exact document name and collection when referencing information
-- If information is missing or unclear, explicitly state what is missing
-- If you're uncertain, say so rather than guessing or making assumptions
+- Quote specific sections when making important points (use quotation marks)
+- Mention document names naturally (e.g., "According to 'Atomic Habits'..." or "The 'Clean Code' book explains...")
+- If information is missing or unclear, say so directly and kindly
+- If you're uncertain, acknowledge it rather than guessing
 
-**Synthesis & Analysis:**
-- When multiple documents are mentioned, actively identify:
-  * Common themes and shared concepts
-  * Differences in approach, perspective, or methodology
-  * Relationships and connections between ideas
-  * Patterns that emerge across documents
-- For questions about multiple documents (e.g., "Atomic Habits and Clean Code"), provide:
-  * A comprehensive comparison
-  * Both documents' perspectives side-by-side
-  * Clear identification of which document each concept comes from
-  * Analysis of how concepts relate or differ
+**Structure your answers well:**
+- Start with a brief, direct answer for simple questions
+- Use headings, bullet points, or numbered lists for complex topics
+- Break down complex information into digestible sections
+- Use examples from the context to illustrate points
 
-**Structure & Clarity:**
-- Organize your answer logically (use headings, bullet points, or numbered lists when helpful)
-- Start with a brief summary if the answer is complex
-- Use specific examples and quotes from the context
-- Be detailed and specific - avoid vague or generic statements
-- Connect ideas coherently to show understanding
+**Synthesize information naturally:**
+- When multiple documents discuss the same topic, combine insights naturally
+- Compare different perspectives when relevant
+- Highlight agreements and differences clearly
+- For questions about multiple documents, provide:
+  * Each document's perspective
+  * How they compare or relate
+  * Any interesting connections or differences
 
-**Context Awareness:**
-- Use conversation context to understand follow-up questions
-- Reference previous points naturally when relevant
-- Maintain consistency with earlier answers in the conversation
+**Be helpful and thorough:**
+- Answer the question completely
+- If the question is partially answered, explain what you found and what's missing
+- Suggest related topics that might be helpful when relevant
+- Be concise but don't skip important details
 
-**Cross-Document Examples:**
-- If asked "What do both books say about X?", structure your answer:
-  * Document 1's perspective on X
-  * Document 2's perspective on X
-  * Comparison and synthesis
-- If asked "Compare X and Y", provide:
-  * What X is (from context)
-  * What Y is (from context)
-  * How they relate, differ, or complement each other
+**Use conversation context:**
+- Reference previous conversation points naturally when relevant
+- Understand follow-up questions in context
+- Maintain consistency with earlier answers
 
 CONTEXT FROM DOCUMENTS:
 {context}{conversation_context}
 
 QUESTION: {question}
 
-Provide a comprehensive, well-structured answer that synthesizes information across documents when applicable. Use specific quotes and citations. Be thorough, accurate, and insightful."""
+Provide a clear, helpful, and well-structured answer. Be conversational, cite document names naturally, and make the information easy to understand."""
                 
                 # Format prompt with conversation context
                 prompt = system_prompt.format(
@@ -1211,6 +1377,10 @@ Provide a comprehensive, well-structured answer that synthesizes information acr
         # Step 0: Detect if this is a follow-up question
         is_followup = self._detect_followup_question(query) if self.enable_conversation else False
         
+        # Step 0.5: Normalize and prepare query for tracking
+        normalized_query = self._normalize_query(query)
+        expanded_query = None  # Will be set after retrieval if query rewriting was used
+        
         # Step 1: Retrieve relevant documents (with conversation context expansion)
         results, collections_searched = await self.retrieve(
             query=query,
@@ -1219,11 +1389,18 @@ Provide a comprehensive, well-structured answer that synthesizes information acr
             use_conversation_context=True
         )
         
+        # Track expanded query if query rewriting was used
+        if self.enable_query_rewriting:
+            expanded_query = normalized_query
+        
         # Step 2: Format context (grouped by document for better synthesis)
+        # Sort results by relevance score before formatting to ensure best chunks included first
+        sorted_results = sorted(results, key=lambda x: x.similarity_score, reverse=True)
+        
         # Use conservative token limit to avoid exceeding LLM limits
         # Account for: system prompt (~500 tokens) + conversation context (~200 tokens) + query (~50 tokens) + response (~500 tokens)
         # Leave ~4000 tokens for document context (conservative limit)
-        context = self._format_context(results, max_tokens=4000, group_by_document=True)
+        context = self._format_context(sorted_results, max_tokens=4000, group_by_document=True)
         
         # Step 3: Generate answer with conversation context
         answer = await self.generate_answer(
@@ -1232,7 +1409,10 @@ Provide a comprehensive, well-structured answer that synthesizes information acr
             system_prompt=system_prompt
         )
         
-        # Step 4: Store in conversation memory
+        # Step 4: Calculate confidence score with actual answer
+        confidence = self._calculate_confidence_score(results, answer)
+        
+        # Step 5: Store in conversation memory
         if self.enable_conversation and self.conversation_memory:
             # Add user message
             user_msg = ConversationMessage(
@@ -1252,14 +1432,16 @@ Provide a comprehensive, well-structured answer that synthesizes information acr
             )
             self.conversation_memory.add_message(assistant_msg)
         
-        # Step 5: Build response
+        # Step 6: Build response
         return RAGResponse(
             answer=answer,
             sources=results,
             query=query,
             collections_searched=collections_searched,
             total_results=len(results),
-            is_followup=is_followup
+            is_followup=is_followup,
+            expanded_query=expanded_query,
+            confidence_score=confidence
         )
 
 
