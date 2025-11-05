@@ -29,6 +29,7 @@ import {
   InputLabel,
   Select,
   MenuItem,
+  FormHelperText,
   Tabs,
   Tab,
   Checkbox,
@@ -79,6 +80,7 @@ const DocumentList = ({ onRefresh }) => {
     name: '',
     purpose: '',
     tags: '',
+    document_type: '',  // Optional: 'book', 'definition', 'article', 'blog_post', 'poem', 'unknown'
     content: '',
     custom_metadata: '',
     chunk_size: 1000,
@@ -347,6 +349,7 @@ const DocumentList = ({ onRefresh }) => {
       name: '',
       purpose: '',
       tags: '',
+      document_type: '',
       content: '',
       custom_metadata: '',
       chunk_size: 1000,
@@ -954,6 +957,9 @@ const DocumentList = ({ onRefresh }) => {
         formDataToSend.append('name', formData.name);
         formDataToSend.append('purpose', formData.purpose);
         formDataToSend.append('tags', formData.tags);
+        if (formData.document_type) {
+          formDataToSend.append('document_type', formData.document_type);
+        }
         formDataToSend.append('chunk_size', formData.chunk_size.toString());
         formDataToSend.append('chunk_overlap', formData.chunk_overlap.toString());
         formDataToSend.append('chunking_strategy', formData.chunking_strategy || 'semantic');
@@ -974,6 +980,7 @@ const DocumentList = ({ onRefresh }) => {
             name: formData.name,
             purpose: formData.purpose,
             tags: formData.tags,
+            document_type: formData.document_type || null,
             custom_metadata: formData.custom_metadata ? JSON.parse(formData.custom_metadata) : {},
           },
           content: formData.content,
@@ -1046,6 +1053,7 @@ const DocumentList = ({ onRefresh }) => {
           name: formData.name,
           purpose: formData.purpose,
           tags: formData.tags,
+          document_type: formData.document_type || null,
           custom_metadata: formData.custom_metadata ? JSON.parse(formData.custom_metadata) : {},
         },
         chunk_size: formData.chunk_size,
@@ -1118,6 +1126,7 @@ const DocumentList = ({ onRefresh }) => {
       name: document.metadata.name || '',
       purpose: document.metadata.purpose || '',
       tags: document.metadata.tags || '',
+      document_type: document.metadata.document_type || '',
       content: document.content || '',
       custom_metadata: JSON.stringify(
         document.metadata.custom_metadata || {},
@@ -1527,6 +1536,28 @@ const DocumentList = ({ onRefresh }) => {
                                     <Typography variant="body2" component="span" sx={{ ml: 1 }}>
                                       {doc.metadata.content_length.toLocaleString()} chars, {doc.metadata.word_count?.toLocaleString() || Math.floor(doc.metadata.content_length / 5)} words
                                     </Typography>
+                                  </Box>
+                                )}
+                                {doc.metadata.embedding_model && (
+                                  <Box>
+                                    <Typography variant="caption" color="text.secondary">Embedding Model:</Typography>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.5 }}>
+                                      <Chip 
+                                        label={doc.metadata.embedding_model} 
+                                        size="small" 
+                                        sx={{ 
+                                          fontSize: '0.7rem',
+                                          height: '22px',
+                                          bgcolor: 'info.light',
+                                          color: 'info.contrastText'
+                                        }} 
+                                      />
+                                      {doc.metadata.embedding_dimension && (
+                                        <Typography variant="caption" color="text.secondary">
+                                          ({doc.metadata.embedding_dimension}D)
+                                        </Typography>
+                                      )}
+                                    </Box>
                                   </Box>
                                 )}
                               </Stack>
@@ -2153,6 +2184,26 @@ const DocumentList = ({ onRefresh }) => {
             disabled={submitting}
             sx={{ mb: 2 }}
           />
+          <FormControl fullWidth sx={{ mb: 2 }}>
+            <InputLabel>Document Type (optional)</InputLabel>
+            <Select
+              value={formData.document_type}
+              label="Document Type (optional)"
+              onChange={(e) => setFormData({ ...formData, document_type: e.target.value })}
+              disabled={submitting}
+            >
+              <MenuItem value="">Auto-detect (default)</MenuItem>
+              <MenuItem value="book">📚 Book</MenuItem>
+              <MenuItem value="definition">📖 Definition/Glossary</MenuItem>
+              <MenuItem value="article">📄 Article</MenuItem>
+              <MenuItem value="blog_post">📝 Blog Post</MenuItem>
+              <MenuItem value="poem">✍️ Poem</MenuItem>
+              <MenuItem value="unknown">❓ Unknown/Other</MenuItem>
+            </Select>
+            <FormHelperText>
+              Specify document type to help with chunking optimization. If not specified, the system will auto-detect.
+            </FormHelperText>
+          </FormControl>
           <TextField
             margin="dense"
             label="Content (leave empty to keep existing)"

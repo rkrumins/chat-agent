@@ -276,12 +276,12 @@ const CollectionList = ({ onRefresh }) => {
                     </IconButton>
                   </Box>
 
-                  <Box onClick={() => handleCollectionClick(collection)}>
+                    <Box onClick={() => handleCollectionClick(collection)}>
                     <Typography variant="body2" color="text.secondary" sx={{ mb: 2, minHeight: 40 }}>
                       {collection.metadata?.description || 'No description'}
                     </Typography>
 
-                    <Stack direction="row" spacing={1}>
+                    <Stack direction="row" spacing={1} sx={{ mb: 1 }}>
                       <Chip
                         label={`${collection.count} documents`}
                         size="small"
@@ -289,6 +289,31 @@ const CollectionList = ({ onRefresh }) => {
                         variant="outlined"
                       />
                     </Stack>
+                    
+                    {/* Embedding Model Info */}
+                    {collection.metadata?.embedding_model && (
+                      <Box sx={{ mt: 1 }}>
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          Embedding Model:
+                        </Typography>
+                        <Chip
+                          label={collection.metadata.embedding_model}
+                          size="small"
+                          sx={{ 
+                            mt: 0.5,
+                            fontSize: '0.7rem',
+                            height: '20px',
+                            bgcolor: 'info.light',
+                            color: 'info.contrastText'
+                          }}
+                        />
+                        {collection.metadata?.embedding_dimension && (
+                          <Typography variant="caption" color="text.secondary" sx={{ ml: 1, display: 'inline' }}>
+                            ({collection.metadata.embedding_dimension}D)
+                          </Typography>
+                        )}
+                      </Box>
+                    )}
                   </Box>
                 </CardContent>
               </Card>

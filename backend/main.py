@@ -72,7 +72,24 @@ embedding_function = get_embedding_function(
     service_account_path=service_account_path
 )
 
-logger.info(f"Embedding provider: {embedding_provider}, model: {embedding_model or 'default'}")
+# Get embedding dimension for metadata
+def get_embedding_dimension():
+    """Get the dimension of the current embedding model"""
+    try:
+        test_embedding = embedding_function(["test"])
+        return len(test_embedding[0]) if test_embedding else 768
+    except:
+        # Default dimensions based on common models
+        if embedding_provider == "gemini":
+            return 768  # Gemini models are 768 dimensions
+        elif embedding_model and "mini" in embedding_model.lower():
+            return 384  # MiniLM models are 384 dimensions
+        else:
+            return 768  # Default to 768 for most models
+
+embedding_dimension = get_embedding_dimension()
+
+logger.info(f"Embedding provider: {embedding_provider}, model: {embedding_model or 'default'}, dimension: {embedding_dimension}")
 
 # In-memory storage for processing status
 processing_status: Dict[str, Dict[str, Any]] = {}
@@ -103,6 +120,7 @@ class DocumentMetadata(BaseModel):
     name: str
     purpose: Optional[str] = ""
     tags: Optional[str] = ""  # Changed to string (comma-separated)
+    document_type: Optional[str] = None  # Optional: 'book', 'definition', 'article', 'blog_post', 'poem', 'unknown'
     custom_metadata: Optional[Dict[str, Any]] = {}
 
 
@@ -1121,20 +1139,34 @@ async def process_document_async(
             processing_status[task_id]["progress"] = 55
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            collection = chroma_client.get_or_create_collection(
-                name=collection_name,
-                metadata={"description": metadata.get("description", "")},
-                embedding_function=embedding_function
-            )
+            # Get or create collection with embedding metadata
+            try:
+                collection = chroma_client.get_collection(name=collection_name)
+            except:
+                # Collection doesn't exist, create it with embedding metadata
+                collection = chroma_client.create_collection(
+                    name=collection_name,
+                    metadata={
+                        "description": metadata.get("description", ""),
+                        "embedding_provider": embedding_provider,
+                        "embedding_model": embedding_model or (f"sentence-transformers/all-mpnet-base-v2" if embedding_provider == "sentence-transformers" else "models/embedding-001"),
+                        "embedding_dimension": embedding_dimension,
+                    },
+                    embedding_function=embedding_function
+                )
             
             # Step 9: Detect document type
             processing_status[task_id]["message"] = "Detecting document type and creating contextual chunks..."
             processing_status[task_id]["progress"] = 60
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
         
-            # Detect document type
-            document_type = detect_document_type(content, metadata)
-            logger.info(f"Detected document type: {document_type} for document: {metadata.get('name', 'Unknown')}")
+            # Detect document type (use provided type if available, otherwise auto-detect)
+            document_type = metadata.get("document_type")
+            if not document_type:
+                document_type = detect_document_type(content, metadata)
+                logger.info(f"Auto-detected document type: {document_type} for document: {metadata.get('name', 'Unknown')}")
+            else:
+                logger.info(f"Using provided document type: {document_type} for document: {metadata.get('name', 'Unknown')}")
             
             # Adaptive chunk sizing based on document type (Mix-of-Granularity approach)
             # Only applies to semantic strategy - user-specified strategies use exact parameters
@@ -1179,6 +1211,10 @@ async def process_document_async(
             chroma_metadata["is_latest"] = True
             chroma_metadata["document_type"] = document_type  # CRITICAL: Add document type to metadata
             chroma_metadata["quality_metrics"] = json.dumps(quality_metrics)  # Store quality metrics
+            # Add embedding model information to document metadata
+            chroma_metadata["embedding_provider"] = embedding_provider
+            chroma_metadata["embedding_model"] = embedding_model or (f"sentence-transformers/all-mpnet-base-v2" if embedding_provider == "sentence-transformers" else "models/embedding-001")
+            chroma_metadata["embedding_dimension"] = embedding_dimension
             
             # Step 10: Store chunks in vector database
             processing_status[task_id]["message"] = "Storing in vector database with contextual chunks..."
@@ -1340,10 +1376,36 @@ async def list_collections():
             except:
                 doc_count = col.count()  # Fallback to total count
             
+            # Get collection metadata, and add default embedding info if missing
+            collection_metadata = col.metadata or {}
+            
+            # If embedding metadata is missing, try to infer it from existing embeddings
+            if not collection_metadata.get("embedding_model"):
+                try:
+                    # Try to get a sample embedding to determine dimension
+                    sample = col.get(limit=1, include=["embeddings"])
+                    if sample["ids"] and sample["embeddings"]:
+                        embedding_dim = len(sample["embeddings"][0])
+                        # Infer model based on dimension
+                        if embedding_dim == 384:
+                            collection_metadata["embedding_model"] = "sentence-transformers/all-MiniLM-L6-v2"
+                            collection_metadata["embedding_provider"] = "sentence-transformers"
+                            collection_metadata["embedding_dimension"] = 384
+                        elif embedding_dim == 768:
+                            # Could be either mpnet or gemini - default to mpnet
+                            collection_metadata["embedding_model"] = "sentence-transformers/all-mpnet-base-v2"
+                            collection_metadata["embedding_provider"] = "sentence-transformers"
+                            collection_metadata["embedding_dimension"] = 768
+                except:
+                    # If we can't infer, use current default
+                    collection_metadata["embedding_model"] = embedding_model or (f"sentence-transformers/all-mpnet-base-v2" if embedding_provider == "sentence-transformers" else "models/embedding-001")
+                    collection_metadata["embedding_provider"] = embedding_provider
+                    collection_metadata["embedding_dimension"] = embedding_dimension
+            
             result_collections.append({
                 "name": col.name,
                 "id": col.id,
-                "metadata": col.metadata,
+                "metadata": collection_metadata,
                 "count": doc_count
             })
         
@@ -1361,6 +1423,9 @@ async def create_collection(collection: CollectionCreate):
             name=collection.name,
             metadata={
                 "description": collection.description,
+                "embedding_provider": embedding_provider,
+                "embedding_model": embedding_model or (f"sentence-transformers/all-mpnet-base-v2" if embedding_provider == "sentence-transformers" else "models/embedding-001"),
+                "embedding_dimension": embedding_dimension,
                 **collection.metadata,
                 "created_at": datetime.utcnow().isoformat()
             },
@@ -1607,6 +1672,7 @@ async def upload_document(
     name: str = Form(...),
     purpose: str = Form(""),
     tags: str = Form(""),
+    document_type: Optional[str] = Form(None),
     chunk_size: int = Form(1000),
     chunk_overlap: int = Form(200),
     chunking_strategy: str = Form("semantic"),
@@ -1776,6 +1842,9 @@ async def update_document(
                 "tags": update.metadata.tags or "",
                 **update.metadata.custom_metadata
             })
+            # Update document_type if provided
+            if update.metadata.document_type is not None:
+                updated_metadata["document_type"] = update.metadata.document_type
         
         updated_metadata["updated_at"] = datetime.utcnow().isoformat()
         
