@@ -36,7 +36,39 @@ const CollectionList = ({ onRefresh }) => {
     description: '',
   });
   const [creating, setCreating] = useState(false);
+  const [nameError, setNameError] = useState('');
   const navigate = useNavigate();
+  
+  // Validate collection name according to ChromaDB rules
+  const validateCollectionName = (name) => {
+    if (!name || !name.trim()) {
+      return 'Collection name is required';
+    }
+    
+    const trimmedName = name.trim();
+    
+    // Check length (3-512 characters)
+    if (trimmedName.length < 3) {
+      return 'Collection name must be at least 3 characters long';
+    }
+    if (trimmedName.length > 512) {
+      return 'Collection name must be 512 characters or less';
+    }
+    
+    // Check allowed characters: [a-zA-Z0-9._-]
+    const validPattern = /^[a-zA-Z0-9._-]+$/;
+    if (!validPattern.test(trimmedName)) {
+      return 'Collection name can only contain letters, numbers, dots (.), underscores (_), and hyphens (-). No spaces allowed.';
+    }
+    
+    // Must start and end with alphanumeric [a-zA-Z0-9]
+    const alphanumericPattern = /^[a-zA-Z0-9].*[a-zA-Z0-9]$|^[a-zA-Z0-9]$/;
+    if (!alphanumericPattern.test(trimmedName)) {
+      return 'Collection name must start and end with a letter or number';
+    }
+    
+    return '';
+  };
 
   const fetchCollections = async () => {
     try {
@@ -58,10 +90,15 @@ const CollectionList = ({ onRefresh }) => {
   }, []);
 
   const handleCreateCollection = async () => {
-    if (!newCollection.name.trim()) {
-      notify.warning('Please enter a collection name');
+    // Validate collection name
+    const validationError = validateCollectionName(newCollection.name);
+    if (validationError) {
+      setNameError(validationError);
+      notify.error(validationError);
       return;
     }
+    
+    setNameError(''); // Clear any previous errors
 
     try {
       setCreating(true);
@@ -69,13 +106,52 @@ const CollectionList = ({ onRefresh }) => {
       notify.success(`Collection "${newCollection.name}" created successfully`);
       setCreateDialogOpen(false);
       setNewCollection({ name: '', description: '' });
+      setNameError('');
       await fetchCollections();
       onRefresh();
     } catch (err) {
-      notify.error('Failed to create collection: ' + err.message);
+      // Parse error message from backend
+      let errorMessage = 'Failed to create collection';
+      
+      if (err.response?.data?.detail) {
+        const detail = err.response.data.detail;
+        // Check for validation errors
+        if (detail.includes('Validation error') || detail.includes('Expected a name')) {
+          errorMessage = 'Invalid collection name. Collection names must:\n' +
+            '• Be 3-512 characters long\n' +
+            '• Contain only letters, numbers, dots (.), underscores (_), and hyphens (-)\n' +
+            '• Start and end with a letter or number\n' +
+            '• Not contain spaces\n\n' +
+            `Example: "software-engineering" or "software_engineering" instead of "Software Engineering"`;
+        } else {
+          errorMessage = detail;
+        }
+      } else if (err.message) {
+        errorMessage = err.message;
+      }
+      
+      setNameError(errorMessage.split('\n')[0]); // Show first line in TextField
+      notify.error(errorMessage);
       console.error('Error creating collection:', err);
     } finally {
       setCreating(false);
+    }
+  };
+  
+  const handleNameChange = (e) => {
+    const name = e.target.value;
+    setNewCollection({ ...newCollection, name });
+    // Clear error when user starts typing
+    if (nameError) {
+      setNameError('');
+    }
+  };
+  
+  const handleDialogClose = () => {
+    if (!creating) {
+      setCreateDialogOpen(false);
+      setNewCollection({ name: '', description: '' });
+      setNameError('');
     }
   };
 
@@ -200,12 +276,12 @@ const CollectionList = ({ onRefresh }) => {
                     </IconButton>
                   </Box>
 
-                  <Box onClick={() => handleCollectionClick(collection)}>
+                    <Box onClick={() => handleCollectionClick(collection)}>
                     <Typography variant="body2" color="text.secondary" sx={{ mb: 2, minHeight: 40 }}>
                       {collection.metadata?.description || 'No description'}
                     </Typography>
 
-                    <Stack direction="row" spacing={1}>
+                    <Stack direction="row" spacing={1} sx={{ mb: 1 }}>
                       <Chip
                         label={`${collection.count} documents`}
                         size="small"
@@ -213,6 +289,31 @@ const CollectionList = ({ onRefresh }) => {
                         variant="outlined"
                       />
                     </Stack>
+                    
+                    {/* Embedding Model Info */}
+                    {collection.metadata?.embedding_model && (
+                      <Box sx={{ mt: 1 }}>
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          Embedding Model:
+                        </Typography>
+                        <Chip
+                          label={collection.metadata.embedding_model}
+                          size="small"
+                          sx={{ 
+                            mt: 0.5,
+                            fontSize: '0.7rem',
+                            height: '20px',
+                            bgcolor: 'info.light',
+                            color: 'info.contrastText'
+                          }}
+                        />
+                        {collection.metadata?.embedding_dimension && (
+                          <Typography variant="caption" color="text.secondary" sx={{ ml: 1, display: 'inline' }}>
+                            ({collection.metadata.embedding_dimension}D)
+                          </Typography>
+                        )}
+                      </Box>
+                    )}
                   </Box>
                 </CardContent>
               </Card>
@@ -224,7 +325,7 @@ const CollectionList = ({ onRefresh }) => {
       {/* Create Collection Dialog */}
       <Dialog
         open={createDialogOpen}
-        onClose={() => !creating && setCreateDialogOpen(false)}
+        onClose={handleDialogClose}
         maxWidth="sm"
         fullWidth
       >
@@ -237,13 +338,33 @@ const CollectionList = ({ onRefresh }) => {
             fullWidth
             required
             value={newCollection.name}
-            onChange={(e) => setNewCollection({ ...newCollection, name: e.target.value })}
+            onChange={handleNameChange}
+            onBlur={(e) => {
+              // Validate on blur
+              const error = validateCollectionName(e.target.value);
+              if (error) {
+                setNameError(error);
+              }
+            }}
             disabled={creating}
+            error={!!nameError}
+            helperText={nameError || '3-512 characters, letters, numbers, dots, underscores, hyphens only. Must start/end with letter/number. Example: "software-engineering"'}
             sx={{ mb: 2 }}
           />
+          
+          {nameError && nameError.includes('spaces') && (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              <Typography variant="body2">
+                <strong>Tip:</strong> Replace spaces with hyphens or underscores. For example:
+                <br />• "Software Engineering" → "software-engineering" or "software_engineering"
+                <br />• "My Collection" → "my-collection" or "my_collection"
+              </Typography>
+            </Alert>
+          )}
+          
           <TextField
             margin="dense"
-            label="Description"
+            label="Description (optional)"
             fullWidth
             multiline
             rows={3}
@@ -253,10 +374,14 @@ const CollectionList = ({ onRefresh }) => {
           />
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setCreateDialogOpen(false)} disabled={creating}>
+          <Button onClick={handleDialogClose} disabled={creating}>
             Cancel
           </Button>
-          <Button onClick={handleCreateCollection} variant="contained" disabled={creating}>
+          <Button 
+            onClick={handleCreateCollection} 
+            variant="contained" 
+            disabled={creating || (!!nameError && newCollection.name.trim() !== '')}
+          >
             {creating ? <CircularProgress size={24} /> : 'Create'}
           </Button>
         </DialogActions>

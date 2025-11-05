@@ -9,4 +9,6 @@ PyPDF2
 python-docx
 openpyxl
 numpy<2.0  # Fix NumPy compatibility with PyTorch
-sentence-transformers  # Required for embeddings (must match chatbot!)
+sentence-transformers  # Required for sentence-transformers embeddings
+google-generativeai  # Required for Gemini embeddings
+google-auth  # Required for GCP service account authentication

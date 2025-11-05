@@ -15,18 +15,13 @@ import io
 import re
 from pathlib import Path
 from typing import Literal
+import os
 
 # Import production utilities
 from utils import (
     validate_file_size, validate_content, validate_chunking_parameters,
     validate_chunk_quality, calculate_content_hash, detect_duplicate_content,
     sanitize_filename, estimate_processing_time, MAX_FILE_SIZE
-)
-
-# Import metadata extraction utilities
-from metadata_extractor import (
-    build_comprehensive_document_metadata,
-    build_comprehensive_chunk_metadata
 )
 
 # File parsing imports
@@ -58,11 +53,43 @@ app.add_middleware(
 # Initialize ChromaDB client
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
-# Initialize embedding function (MUST match chatbot's embedding model!)
-# Using sentence-transformers model that chatbot uses
-embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+# Initialize embedding function
+# Supports both sentence-transformers and Gemini embeddings
+# Configure via environment variables:
+#   EMBEDDING_PROVIDER: "sentence-transformers" (default) or "gemini"
+#   EMBEDDING_MODEL: Model name (e.g., "all-mpnet-base-v2" or "models/embedding-001")
+#   GOOGLE_APPLICATION_CREDENTIALS: Path to GCP service account JSON key (for Gemini)
+#   GOOGLE_API_KEY: Google API key (alternative to service account)
+from embedding_utils import get_embedding_function
+
+embedding_provider = os.getenv("EMBEDDING_PROVIDER", "sentence-transformers")
+embedding_model = os.getenv("EMBEDDING_MODEL", None)
+service_account_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", None)
+
+embedding_function = get_embedding_function(
+    provider=embedding_provider,
+    model_name=embedding_model,
+    service_account_path=service_account_path
 )
+
+# Get embedding dimension for metadata
+def get_embedding_dimension():
+    """Get the dimension of the current embedding model"""
+    try:
+        test_embedding = embedding_function(["test"])
+        return len(test_embedding[0]) if test_embedding else 768
+    except:
+        # Default dimensions based on common models
+        if embedding_provider == "gemini":
+            return 768  # Gemini models are 768 dimensions
+        elif embedding_model and "mini" in embedding_model.lower():
+            return 384  # MiniLM models are 384 dimensions
+        else:
+            return 768  # Default to 768 for most models
+
+embedding_dimension = get_embedding_dimension()
+
+logger.info(f"Embedding provider: {embedding_provider}, model: {embedding_model or 'default'}, dimension: {embedding_dimension}")
 
 # In-memory storage for processing status
 processing_status: Dict[str, Dict[str, Any]] = {}
@@ -92,9 +119,8 @@ class ChunkingStrategy(str, Enum):
 class DocumentMetadata(BaseModel):
     name: str
     purpose: Optional[str] = ""
-    tags: Optional[str] = ""  # Comma-separated tags
-    author: Optional[str] = None  # Document author/creator
-    source: Optional[str] = None  # Source of the document (e.g., 'confluence', 'github', 'upload')
+    tags: Optional[str] = ""  # Changed to string (comma-separated)
+    document_type: Optional[str] = None  # Optional: 'book', 'definition', 'article', 'blog_post', 'poem', 'unknown'
     custom_metadata: Optional[Dict[str, Any]] = {}
 
 
@@ -980,7 +1006,7 @@ async def process_document_async(
     task_id: str,
     collection_name: str,
     document_id: str,
-    content: str,
+    content: Optional[str],
     metadata: Dict[str, Any],
     chunk_size: int = 500,
     chunk_overlap: int = 50,
@@ -988,7 +1014,9 @@ async def process_document_async(
     chunk_separator: Optional[str] = None,
     max_chunks: Optional[int] = None,
     version: int = 1,
-    max_retries: int = 3
+    max_retries: int = 3,
+    file_content: Optional[bytes] = None,
+    filename: Optional[str] = None
 ):
     """Process document asynchronously with status updates, validation, and error recovery"""
     retry_count = 0
@@ -998,25 +1026,38 @@ async def process_document_async(
         try:
             # Update status
             processing_status[task_id]["status"] = ProcessingStatus.PROCESSING
-            processing_status[task_id]["message"] = "Validating document content..." if retry_count == 0 else f"Retrying (attempt {retry_count + 1}/{max_retries + 1})..."
+            processing_status[task_id]["message"] = "Parsing file..." if file_content else ("Validating document content..." if retry_count == 0 else f"Retrying (attempt {retry_count + 1}/{max_retries + 1})...")
             processing_status[task_id]["progress"] = 5
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            # Step 1: Validate content
+            # Step 1: Parse file if file_content is provided (for file uploads)
+            if file_content is not None and filename:
+                try:
+                    content = parse_file(filename, file_content)
+                    processing_status[task_id]["message"] = "File parsed successfully, validating content..."
+                    processing_status[task_id]["progress"] = 8
+                    processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
+                except Exception as e:
+                    raise ValueError(f"Error parsing file: {str(e)}")
+            
+            if content is None:
+                raise ValueError("No content provided - either content or file_content must be provided")
+            
+            # Step 2: Validate content
             is_valid, error_msg, sanitized_content = validate_content(content)
             if not is_valid:
                 raise ValueError(f"Content validation failed: {error_msg}")
             
             content = sanitized_content  # Use sanitized content
             
-            # Step 2: Validate chunking parameters
+            # Step 3: Validate chunking parameters
             is_valid, error_msg = validate_chunking_parameters(
                 chunk_size, chunk_overlap, chunking_strategy, max_chunks
             )
             if not is_valid:
                 raise ValueError(f"Chunking parameter validation failed: {error_msg}")
             
-            # Step 3: Check for duplicates (optional - can be disabled in metadata)
+            # Step 4: Check for duplicates (optional - can be disabled in metadata)
             check_duplicates = metadata.get("check_duplicates", True)
             if check_duplicates:
                 processing_status[task_id]["message"] = "Checking for duplicates..."
@@ -1045,7 +1086,7 @@ async def process_document_async(
             processing_status[task_id]["estimated_time"] = time_estimate.get("estimated_total_time", 0)
             processing_status[task_id]["estimated_chunks"] = time_estimate.get("estimated_chunks", 0)
             
-            # Step 5: Chunk document
+            # Step 6: Chunk document
             processing_status[task_id]["message"] = "Chunking document..."
             processing_status[task_id]["progress"] = 20
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
@@ -1064,12 +1105,15 @@ async def process_document_async(
                 max_chunks=max_chunks_param
             )
             
-            # Step 6: Validate chunk quality
+            # Step 7: Validate chunk quality
             processing_status[task_id]["message"] = "Validating chunk quality..."
             processing_status[task_id]["progress"] = 40
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            valid_chunks, quality_metrics = validate_chunk_quality(chunks)
+            # For "lines" strategy, don't filter small chunks (each line is a valid chunk regardless of size)
+            # For other strategies, use strict size validation
+            strict_min_size = strategy != "lines"
+            valid_chunks, quality_metrics = validate_chunk_quality(chunks, strict_min_size=strict_min_size)
             
             # Store quality metrics in processing status
             processing_status[task_id]["quality_metrics"] = quality_metrics
@@ -1095,20 +1139,34 @@ async def process_document_async(
             processing_status[task_id]["progress"] = 55
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            collection = chroma_client.get_or_create_collection(
-                name=collection_name,
-                metadata={"description": metadata.get("description", "")},
-                embedding_function=embedding_function
-            )
+            # Get or create collection with embedding metadata
+            try:
+                collection = chroma_client.get_collection(name=collection_name)
+            except:
+                # Collection doesn't exist, create it with embedding metadata
+                collection = chroma_client.create_collection(
+                    name=collection_name,
+                    metadata={
+                        "description": metadata.get("description", ""),
+                        "embedding_provider": embedding_provider,
+                        "embedding_model": embedding_model or (f"sentence-transformers/all-mpnet-base-v2" if embedding_provider == "sentence-transformers" else "models/embedding-001"),
+                        "embedding_dimension": embedding_dimension,
+                    },
+                    embedding_function=embedding_function
+                )
             
-            # Step 8: Detect document type
+            # Step 9: Detect document type
             processing_status[task_id]["message"] = "Detecting document type and creating contextual chunks..."
             processing_status[task_id]["progress"] = 60
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
         
-            # Detect document type
-            document_type = detect_document_type(content, metadata)
-            logger.info(f"Detected document type: {document_type} for document: {metadata.get('name', 'Unknown')}")
+            # Detect document type (use provided type if available, otherwise auto-detect)
+            document_type = metadata.get("document_type")
+            if not document_type:
+                document_type = detect_document_type(content, metadata)
+                logger.info(f"Auto-detected document type: {document_type} for document: {metadata.get('name', 'Unknown')}")
+            else:
+                logger.info(f"Using provided document type: {document_type} for document: {metadata.get('name', 'Unknown')}")
             
             # Adaptive chunk sizing based on document type (Mix-of-Granularity approach)
             # Only applies to semantic strategy - user-specified strategies use exact parameters
@@ -1136,33 +1194,27 @@ async def process_document_async(
                     chunk_size = adaptive_chunk_size
                     chunk_overlap = adaptive_overlap
         
-            # Step 9: Prepare comprehensive metadata for ChromaDB
-            processing_status[task_id]["message"] = "Preparing comprehensive metadata..."
+            # Step 10: Prepare metadata for ChromaDB
+            processing_status[task_id]["message"] = "Preparing metadata..."
             processing_status[task_id]["progress"] = 70
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            # Add chunking parameters to metadata for document
-            metadata["chunk_size"] = chunk_size
-            metadata["chunk_overlap"] = chunk_overlap
-            metadata["chunking_strategy"] = strategy
-            metadata["chunk_separator"] = separator
-            metadata["max_chunks"] = max_chunks_param
-            metadata["chunk_count"] = len(chunks)
-            metadata["quality_metrics"] = quality_metrics
-            
-            # Build comprehensive document metadata following RAG best practices
-            document_metadata = build_comprehensive_document_metadata(
-                document_id=document_id,
-                name=metadata.get("name", "Unknown"),
-                metadata=metadata,
-                collection_name=collection_name,
-                document_type=document_type,
-                content=content,
-                version=version
-            )
-            
-            # Prepare for ChromaDB (convert lists/dicts to strings)
-            chroma_metadata = prepare_metadata_for_chroma(document_metadata)
+            chroma_metadata = prepare_metadata_for_chroma(metadata)
+            chroma_metadata["chunk_size"] = chunk_size
+            chroma_metadata["chunk_overlap"] = chunk_overlap
+            chroma_metadata["chunking_strategy"] = strategy  # Store chunking strategy used
+            if separator:
+                chroma_metadata["chunk_separator"] = separator
+            if max_chunks_param:
+                chroma_metadata["max_chunks"] = max_chunks_param
+            chroma_metadata["version"] = version
+            chroma_metadata["is_latest"] = True
+            chroma_metadata["document_type"] = document_type  # CRITICAL: Add document type to metadata
+            chroma_metadata["quality_metrics"] = json.dumps(quality_metrics)  # Store quality metrics
+            # Add embedding model information to document metadata
+            chroma_metadata["embedding_provider"] = embedding_provider
+            chroma_metadata["embedding_model"] = embedding_model or (f"sentence-transformers/all-mpnet-base-v2" if embedding_provider == "sentence-transformers" else "models/embedding-001")
+            chroma_metadata["embedding_dimension"] = embedding_dimension
             
             # Step 10: Store chunks in vector database
             processing_status[task_id]["message"] = "Storing in vector database with contextual chunks..."
@@ -1174,57 +1226,60 @@ async def process_document_async(
             if len(chunks) >= 1:
                 chunk_ids = [f"{document_id}_chunk_{i}" for i in range(len(chunks))]
                 contextual_chunks = []
-                chunk_metadata_list = []
+                chunk_metadata = []
                 
                 document_name = metadata.get("name", "Unknown")
                 
                 for i, chunk in enumerate(chunks):
-                    # Create contextual chunk with document type and metadata prepended
-                    contextual_chunk = create_contextual_chunk(
-                        chunk_text=chunk,
-                        document_name=document_name,
-                        document_type=document_type,
-                        chunk_number=i + 1,
-                        total_chunks=len(chunks),
-                        metadata=metadata
-                    )
-                    contextual_chunks.append(contextual_chunk)
+                    # Store chunks directly without contextual prefix
+                    # Document metadata is already in chunk_metadata and will be used for filtering/formatting
+                    # This preserves more actual content space per chunk
+                    contextual_chunks.append(chunk)
                     
-                    # Build comprehensive chunk metadata following RAG best practices
-                    previous_chunk = chunks[i - 1] if i > 0 else None
-                    chunk_meta = build_comprehensive_chunk_metadata(
-                        chunk_id=chunk_ids[i],
-                        chunk_index=i,
-                        chunk_text=chunk,
-                        document_metadata=document_metadata,
-                        document_content=content,
-                        previous_chunk_text=previous_chunk
-                    )
-                    
-                    # Prepare for ChromaDB (convert lists/dicts to strings)
-                    chunk_meta_processed = prepare_metadata_for_chroma(chunk_meta)
-                    chunk_metadata_list.append(chunk_meta_processed)
+                    chunk_meta = {
+                        **chroma_metadata,
+                        "chunk_index": i,
+                        "chunk_number": i + 1,  # Human-readable chunk number (1-indexed)
+                        "total_chunks": len(chunks),
+                        "parent_id": document_id,
+                        "parent_name": document_name,
+                        "is_chunk": True,
+                        # Ensure document name is preserved for reference
+                        "document_name": document_name,
+                        "document_version": version,
+                        "document_type": document_type,  # CRITICAL: Document type in chunk metadata
+                    }
+                    chunk_metadata.append(chunk_meta)
                 
-                # Add contextual chunks to collection (these include document type in the text)
+                # Add chunks to collection with metadata
+                # Document type and name are stored in metadata, not in chunk text
+                # This preserves more actual content space per chunk
                 collection.add(
-                    documents=contextual_chunks,  # Use contextual chunks, not raw chunks
-                    metadatas=chunk_metadata_list,  # Enhanced metadata with topics, content type, etc.
+                    documents=contextual_chunks,  # Raw chunks without prefixes
+                    metadatas=chunk_metadata,
                     ids=chunk_ids
                 )
                 
-                logger.info(f"Stored {len(contextual_chunks)} contextual chunks for document type: {document_type}")
+                logger.info(f"Stored {len(contextual_chunks)} chunks for document type: {document_type}")
             
             # Step 11: Store full document
-            processing_status[task_id]["message"] = "Storing document with comprehensive metadata..."
+            processing_status[task_id]["message"] = "Storing document metadata..."
             processing_status[task_id]["progress"] = 90
             processing_status[task_id]["updated_at"] = datetime.utcnow().isoformat()
             
-            # Update timestamp
-            chroma_metadata["updated_at"] = datetime.utcnow().isoformat()
-            chroma_metadata["is_chunk"] = False
+            # Calculate content statistics
+            content_length = len(content)
+            word_count = len(content.split()) if content else 0
             
-            # Full document metadata is already comprehensive from build_comprehensive_document_metadata
-            full_doc_metadata = chroma_metadata
+            full_doc_metadata = {
+                **chroma_metadata,
+                "is_chunk": False,
+                "chunk_count": len(chunks),
+                "document_type": document_type,  # Ensure document type is stored
+                "content_length": content_length,  # Add character count
+                "word_count": word_count,  # Add word count
+                "updated_at": datetime.utcnow().isoformat()
+            }
             
             collection.add(
                 documents=[content],
@@ -1321,10 +1376,36 @@ async def list_collections():
             except:
                 doc_count = col.count()  # Fallback to total count
             
+            # Get collection metadata, and add default embedding info if missing
+            collection_metadata = col.metadata or {}
+            
+            # If embedding metadata is missing, try to infer it from existing embeddings
+            if not collection_metadata.get("embedding_model"):
+                try:
+                    # Try to get a sample embedding to determine dimension
+                    sample = col.get(limit=1, include=["embeddings"])
+                    if sample["ids"] and sample["embeddings"]:
+                        embedding_dim = len(sample["embeddings"][0])
+                        # Infer model based on dimension
+                        if embedding_dim == 384:
+                            collection_metadata["embedding_model"] = "sentence-transformers/all-MiniLM-L6-v2"
+                            collection_metadata["embedding_provider"] = "sentence-transformers"
+                            collection_metadata["embedding_dimension"] = 384
+                        elif embedding_dim == 768:
+                            # Could be either mpnet or gemini - default to mpnet
+                            collection_metadata["embedding_model"] = "sentence-transformers/all-mpnet-base-v2"
+                            collection_metadata["embedding_provider"] = "sentence-transformers"
+                            collection_metadata["embedding_dimension"] = 768
+                except:
+                    # If we can't infer, use current default
+                    collection_metadata["embedding_model"] = embedding_model or (f"sentence-transformers/all-mpnet-base-v2" if embedding_provider == "sentence-transformers" else "models/embedding-001")
+                    collection_metadata["embedding_provider"] = embedding_provider
+                    collection_metadata["embedding_dimension"] = embedding_dimension
+            
             result_collections.append({
                 "name": col.name,
                 "id": col.id,
-                "metadata": col.metadata,
+                "metadata": collection_metadata,
                 "count": doc_count
             })
         
@@ -1342,6 +1423,9 @@ async def create_collection(collection: CollectionCreate):
             name=collection.name,
             metadata={
                 "description": collection.description,
+                "embedding_provider": embedding_provider,
+                "embedding_model": embedding_model or (f"sentence-transformers/all-mpnet-base-v2" if embedding_provider == "sentence-transformers" else "models/embedding-001"),
+                "embedding_dimension": embedding_dimension,
                 **collection.metadata,
                 "created_at": datetime.utcnow().isoformat()
             },
@@ -1354,8 +1438,22 @@ async def create_collection(collection: CollectionCreate):
             "message": "Collection created successfully"
         }
     except Exception as e:
-        logger.error(f"Error creating collection: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        error_msg = str(e)
+        logger.error(f"Error creating collection: {error_msg}")
+        
+        # Provide user-friendly error message for validation errors
+        if "Validation error" in error_msg or "Expected a name" in error_msg:
+            user_friendly_msg = (
+                "Invalid collection name. Collection names must:\n"
+                "• Be 3-512 characters long\n"
+                "• Contain only letters, numbers, dots (.), underscores (_), and hyphens (-)\n"
+                "• Start and end with a letter or number\n"
+                "• Not contain spaces\n\n"
+                f"Example: Use 'software-engineering' or 'software_engineering' instead of '{collection.name}'"
+            )
+            raise HTTPException(status_code=400, detail=user_friendly_msg)
+        
+        raise HTTPException(status_code=400, detail=error_msg)
 
 
 @app.delete("/collections/{collection_name}")
@@ -1401,6 +1499,12 @@ async def list_documents(
                 continue
             
             content = all_results["documents"][i] if all_results["documents"] else ""
+            
+            # Calculate content_length and word_count if not in metadata
+            if "content_length" not in metadata:
+                metadata["content_length"] = len(content)
+            if "word_count" not in metadata:
+                metadata["word_count"] = len(content.split()) if content else 0
             
             documents.append({
                 "id": doc_id,
@@ -1448,6 +1552,12 @@ async def get_document(collection_name: str, document_id: str):
         metadata = result["metadatas"][0] if result["metadatas"] else {}
         content = result["documents"][0] if result["documents"] else ""
         
+        # Calculate content_length and word_count if not in metadata
+        if "content_length" not in metadata:
+            metadata["content_length"] = len(content)
+        if "word_count" not in metadata:
+            metadata["word_count"] = len(content.split()) if content else 0
+        
         return {
             "id": document_id,
             "collection_name": collection_name,
@@ -1460,73 +1570,6 @@ async def get_document(collection_name: str, document_id: str):
         raise
     except Exception as e:
         logger.error(f"Error getting document: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/collections/{collection_name}/documents/{document_id}/chunks")
-async def get_document_chunks(collection_name: str, document_id: str, skip: int = 0, limit: int = 100):
-    """Get all chunks for a specific document with metadata"""
-    try:
-        collection = chroma_client.get_collection(
-            name=collection_name,
-            embedding_function=embedding_function
-        )
-        
-        # Get all documents to find chunks (ids are returned by default)
-        all_results = collection.get(include=["documents", "metadatas"])
-        
-        chunks = []
-        for i, doc_id in enumerate(all_results["ids"]):
-            metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
-            
-            # Check if this is a chunk belonging to the requested document
-            if (metadata.get("parent_id") == document_id or 
-                metadata.get("document_id") == document_id) and \
-               metadata.get("is_chunk") is True:
-                
-                content = all_results["documents"][i] if all_results["documents"] else ""
-                
-                # Clean up contextual prefixes for display
-                display_content = content
-                if "[DOCUMENT_TYPE:" in display_content:
-                    lines = display_content.split("\n\n")
-                    if len(lines) > 1:
-                        display_content = "\n\n".join(lines[1:])
-                
-                chunk_data = {
-                    "id": doc_id,
-                    "chunk_index": metadata.get("chunk_index", 0),
-                    "chunk_number": metadata.get("chunk_number", 0),
-                    "content": display_content,
-                    "raw_content": content,  # Keep original for reference
-                    "metadata": metadata,
-                    "length": len(content),
-                    "word_count": metadata.get("word_count", len(content.split())),
-                    "content_type": metadata.get("content_type", "paragraph"),
-                    "topics": metadata.get("topics", ""),
-                    "difficulty_level": metadata.get("difficulty_level", "Intermediate"),
-                    "section_title": metadata.get("section_title", ""),
-                    "chunk_position": metadata.get("chunk_position", ""),
-                }
-                chunks.append(chunk_data)
-        
-        # Sort by chunk index
-        chunks.sort(key=lambda x: x.get("chunk_index", 0))
-        
-        # Apply pagination
-        total = len(chunks)
-        paginated_chunks = chunks[skip:skip+limit]
-        
-        return {
-            "chunks": paginated_chunks,
-            "total": total,
-            "skip": skip,
-            "limit": limit
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting document chunks: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1581,13 +1624,11 @@ async def create_document(
             "updated_at": datetime.utcnow().isoformat()
         }
         
-        # Prepare metadata with enhanced fields
+        # Prepare metadata
         metadata = {
             "name": document.metadata.name,
             "purpose": document.metadata.purpose or "",
             "tags": document.metadata.tags or "",
-            "author": document.metadata.author,
-            "source": document.metadata.source,
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
             **document.metadata.custom_metadata
@@ -1596,17 +1637,17 @@ async def create_document(
         # Queue background processing
         background_tasks.add_task(
             process_document_async,
-            task_id,
-            collection_name,
-            document_id,
-            document.content,
-            metadata,
-            document.chunk_size,
-            document.chunk_overlap,
-            document.chunking_strategy or "semantic",
-            document.chunk_separator,
-            document.max_chunks,
-            version
+            task_id=task_id,
+            collection_name=collection_name,
+            document_id=document_id,
+            content=document.content,
+            metadata=metadata,
+            chunk_size=document.chunk_size,
+            chunk_overlap=document.chunk_overlap,
+            chunking_strategy=document.chunking_strategy or "semantic",
+            chunk_separator=document.chunk_separator,
+            max_chunks=document.max_chunks,
+            version=version
         )
         
         return {
@@ -1631,8 +1672,7 @@ async def upload_document(
     name: str = Form(...),
     purpose: str = Form(""),
     tags: str = Form(""),
-    author: str = Form(None),
-    source: str = Form(None),
+    document_type: Optional[str] = Form(None),
     chunk_size: int = Form(1000),
     chunk_overlap: int = Form(200),
     chunking_strategy: str = Form("semantic"),
@@ -1643,7 +1683,7 @@ async def upload_document(
 ):
     """Upload and process a document file with validation"""
     try:
-        # Step 1: Validate file size
+        # Step 1: Validate file size (quick check)
         file_content = await file.read()
         file_size = len(file_content)
         
@@ -1651,30 +1691,25 @@ async def upload_document(
         if not is_valid:
             raise HTTPException(status_code=400, detail=error_msg)
         
-        # Step 2: Sanitize filename
+        # Step 2: Sanitize filename and validate extension (quick check)
         sanitized_filename = sanitize_filename(file.filename)
+        extension = Path(sanitized_filename).suffix.lower()
+        supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.text', '.json']
+        if extension not in supported_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {extension}. Supported: {', '.join(supported_extensions)}"
+            )
         
-        # Step 3: Parse file based on type
-        try:
-            content = parse_file(sanitized_filename, file_content)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error parsing file: {str(e)}")
-        
-        # Step 4: Validate and sanitize content
-        is_valid, error_msg, sanitized_content = validate_content(content)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=f"Content validation failed: {error_msg}")
-        
-        content = sanitized_content
-        
-        # Step 5: Validate chunking parameters
+        # Step 3: Validate chunking parameters (quick check)
         is_valid, error_msg = validate_chunking_parameters(
             chunk_size, chunk_overlap, chunking_strategy, max_chunks
         )
         if not is_valid:
             raise HTTPException(status_code=400, detail=error_msg)
+        
+        # NOTE: File parsing and content validation are now done in the background task
+        # to avoid blocking the UI. Only quick validations (size, extension) are done here.
         
         collection = chroma_client.get_or_create_collection(
             name=collection_name,
@@ -1707,13 +1742,11 @@ async def upload_document(
         except json.JSONDecodeError:
             custom_meta = {}
         
-        # Prepare metadata with enhanced fields
+        # Prepare metadata
         metadata = {
             "name": name,
-            "purpose": purpose or "",
-            "tags": tags or "",
-            "author": author or None,
-            "source": source or None,
+            "purpose": purpose,
+            "tags": tags,
             "filename": sanitized_filename,
             "original_filename": file.filename,
             "file_type": Path(sanitized_filename).suffix.lower(),
@@ -1739,19 +1772,23 @@ async def upload_document(
         if max_chunks_int:
             metadata["max_chunks"] = max_chunks_int
         
+        # Queue background processing - file_content is passed instead of parsed content
+        # This allows parsing to happen in the background, making the upload non-blocking
         background_tasks.add_task(
             process_document_async,
-            task_id,
-            collection_name,
-            document_id,
-            content,
-            metadata,
-            chunk_size,
-            chunk_overlap,
-            chunking_strategy or "semantic",
-            chunk_separator if chunk_separator and chunk_separator != "null" else None,
-            max_chunks_int,
-            version
+            task_id=task_id,
+            collection_name=collection_name,
+            document_id=document_id,
+            content=None,  # content will be None, indicating we need to parse file_content
+            metadata=metadata,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            chunking_strategy=chunking_strategy or "semantic",
+            chunk_separator=chunk_separator if chunk_separator and chunk_separator != "null" else None,
+            max_chunks=max_chunks_int,
+            version=version,
+            file_content=file_content,  # Pass raw file content for background parsing
+            filename=sanitized_filename  # Pass filename for parsing
         )
         
         return {
@@ -1805,6 +1842,9 @@ async def update_document(
                 "tags": update.metadata.tags or "",
                 **update.metadata.custom_metadata
             })
+            # Update document_type if provided
+            if update.metadata.document_type is not None:
+                updated_metadata["document_type"] = update.metadata.document_type
         
         updated_metadata["updated_at"] = datetime.utcnow().isoformat()
         
@@ -1862,16 +1902,16 @@ async def update_document(
         # Queue background processing with all chunking parameters
         background_tasks.add_task(
             process_document_async,
-            task_id,
-            collection_name,
-            document_id,
-            updated_content,
-            updated_metadata,
-            chunk_size,
-            chunk_overlap,
-            chunking_strategy,
-            chunk_separator,
-            max_chunks
+            task_id=task_id,
+            collection_name=collection_name,
+            document_id=document_id,
+            content=updated_content,
+            metadata=updated_metadata,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            chunking_strategy=chunking_strategy,
+            chunk_separator=chunk_separator,
+            max_chunks=max_chunks
         )
         
         return {
@@ -1928,6 +1968,94 @@ async def delete_document(collection_name: str, document_id: str):
     except Exception as e:
         logger.error(f"Error deleting document: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/collections/{collection_name}/documents/{document_id}/chunks")
+async def get_document_chunks(
+    collection_name: str,
+    document_id: str,
+    skip: int = 0,
+    limit: int = 100
+):
+    """Get all chunks for a specific document with metadata"""
+    try:
+        collection = chroma_client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_function
+        )
+        
+        # Get all items from collection
+        # Note: ids are always returned, don't include them in the include parameter
+        all_results = collection.get(include=["documents", "metadatas"])
+        
+        if not all_results["ids"]:
+            logger.warning(f"No items found in collection '{collection_name}'")
+            return {
+                "chunks": [],
+                "total": 0,
+                "skip": skip,
+                "limit": limit,
+                "document_id": document_id
+            }
+        
+        # Filter chunks that belong to this document
+        chunks = []
+        for i, chunk_id in enumerate(all_results["ids"]):
+            metadata = all_results["metadatas"][i] if all_results["metadatas"] else {}
+            
+            # Check if this is a chunk belonging to the document
+            is_chunk = metadata.get("is_chunk")
+            if is_chunk is True:
+                # Check if it belongs to this document by parent_id
+                parent_id = metadata.get("parent_id")
+                
+                # Also check if chunk_id pattern matches (format: {document_id}_chunk_{index})
+                belongs_to_document = (
+                    parent_id == document_id or 
+                    chunk_id.startswith(f"{document_id}_chunk_") or
+                    chunk_id.startswith(f"{document_id}_chunk")
+                )
+                
+                if belongs_to_document:
+                    content = all_results["documents"][i] if all_results["documents"] else ""
+                    
+                    # Calculate chunk statistics
+                    chunk_length = len(content)
+                    chunk_word_count = len(content.split()) if content else 0
+                    
+                    chunks.append({
+                        "id": chunk_id,
+                        "content": content,
+                        "metadata": metadata,
+                        "chunk_number": metadata.get("chunk_number", 0),
+                        "total_chunks": metadata.get("total_chunks", 0),
+                        "chunk_index": metadata.get("chunk_index", 0),
+                        "document_type": metadata.get("document_type", "unknown"),
+                        "parent_id": parent_id,
+                        "parent_name": metadata.get("parent_name") or metadata.get("name", "Unknown"),
+                        "length": chunk_length,  # Character count for UI
+                        "word_count": chunk_word_count  # Word count for UI
+                    })
+        
+        # Sort chunks by chunk_number
+        chunks.sort(key=lambda x: x.get("chunk_number", 0))
+        
+        logger.info(f"Found {len(chunks)} chunks for document {document_id} in collection {collection_name}")
+        
+        # Apply pagination
+        total_chunks = len(chunks)
+        paginated_chunks = chunks[skip:skip+limit]
+        
+        return {
+            "chunks": paginated_chunks,
+            "total": total_chunks,
+            "skip": skip,
+            "limit": limit,
+            "document_id": document_id
+        }
+    except Exception as e:
+        logger.error(f"Error getting document chunks for {document_id} in {collection_name}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting document chunks: {str(e)}")
 
 
 # Document version endpoints
@@ -2004,16 +2132,84 @@ async def search_documents(
 ):
     """Search for similar documents in a collection"""
     try:
-        collection = chroma_client.get_collection(
-            name=collection_name,
-            embedding_function=embedding_function
-        )
+        # Try to get collection with current embedding function first
+        try:
+            collection = chroma_client.get_collection(
+                name=collection_name,
+                embedding_function=embedding_function
+            )
+            # Collection uses current embedding function - can query directly
+            query_embedding_func = embedding_function
+        except Exception as e:
+            # If that fails, try to get collection without embedding function
+            # This might be an old collection with different embedding dimensions
+            try:
+                collection = chroma_client.get_collection(name=collection_name)
+                
+                # Check the collection's embedding dimension
+                # Get a sample to check dimension
+                sample = collection.get(limit=1, include=["embeddings"])
+                if sample["ids"] and sample["embeddings"]:
+                    existing_dim = len(sample["embeddings"][0])
+                    current_dim = len(embedding_function(["test"])[0]) if embedding_function else 768
+                    
+                    if existing_dim != current_dim:
+                        logger.warning(
+                            f"Collection '{collection_name}' has embedding dimension {existing_dim}, "
+                            f"but current model uses {current_dim}. This collection may need to be migrated."
+                        )
+                        # For old collections, we can't query with the new embedding function
+                        # Return empty results with a helpful message
+                        return {
+                            "query": query,
+                            "results": [],
+                            "count": 0,
+                            "warning": f"Collection uses different embedding model (dimension {existing_dim}). "
+                                     f"Please re-upload documents to this collection to use the new embedding model."
+                        }
+                
+                # Collection exists but might have issues - try to query anyway
+                query_embedding_func = None  # Use collection's default
+            except Exception as e2:
+                logger.error(f"Collection '{collection_name}' not found or inaccessible: {str(e2)}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Collection '{collection_name}' not found or inaccessible: {str(e2)}"
+                )
         
-        results = collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"]
-        )
+        # Perform the search query
+        try:
+            if query_embedding_func:
+                # Use the current embedding function
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances"]
+                )
+            else:
+                # Collection doesn't match current embedding function
+                # Try to query without specifying embedding function (uses collection's default)
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances"]
+                )
+        except Exception as query_error:
+            error_msg = str(query_error)
+            if "dimension" in error_msg.lower() or "embedding" in error_msg.lower():
+                logger.error(
+                    f"Embedding dimension mismatch for collection '{collection_name}': {error_msg}"
+                )
+                return {
+                    "query": query,
+                    "results": [],
+                    "count": 0,
+                    "warning": f"This collection uses a different embedding model. "
+                             f"Please re-upload documents to migrate to the current model."
+                }
+            else:
+                # Re-raise other query errors
+                raise
         
         search_results = []
         if results["ids"] and results["ids"][0]:
@@ -2030,9 +2226,11 @@ async def search_documents(
             "results": search_results,
             "count": len(search_results)
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error searching documents: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error searching documents in collection '{collection_name}': {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error searching documents: {str(e)}")
 
 
 # Analytics endpoints

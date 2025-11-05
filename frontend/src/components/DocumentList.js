@@ -29,6 +29,7 @@ import {
   InputLabel,
   Select,
   MenuItem,
+  FormHelperText,
   Tabs,
   Tab,
   Checkbox,
@@ -79,6 +80,7 @@ const DocumentList = ({ onRefresh }) => {
     name: '',
     purpose: '',
     tags: '',
+    document_type: '',  // Optional: 'book', 'definition', 'article', 'blog_post', 'poem', 'unknown'
     content: '',
     custom_metadata: '',
     chunk_size: 1000,
@@ -130,7 +132,7 @@ const DocumentList = ({ onRefresh }) => {
     setFilteredDocuments(filtered);
   }, [searchQuery, documents]);
 
-  // Poll for task status
+  // Poll for task status - optimized to avoid unnecessary re-renders
   useEffect(() => {
     const taskIds = Object.keys(processingTasks);
     if (taskIds.length === 0) return;
@@ -139,27 +141,46 @@ const DocumentList = ({ onRefresh }) => {
       for (const taskId of taskIds) {
         try {
           const status = await tasksAPI.getStatus(taskId);
-          setProcessingTasks((prev) => ({
-            ...prev,
-            [taskId]: status,
-          }));
+          setProcessingTasks((prev) => {
+            const current = prev[taskId];
+            // Only update if status or progress changed to avoid unnecessary re-renders
+            if (!current || current.status !== status.status || current.progress !== status.progress) {
+              return {
+                ...prev,
+                [taskId]: status,
+              };
+            }
+            return prev;
+          });
 
-          if (status.status === 'completed' || status.status === 'failed') {
+          // Handle completion or failure
+          if (status.status === 'completed') {
+            notify.success(`Document "${status.message || 'processed'}" completed successfully!`);
             setTimeout(() => {
               setProcessingTasks((prev) => {
                 const updated = { ...prev };
                 delete updated[taskId];
                 return updated;
               });
+              // Refresh documents list when task completes
               fetchDocuments();
               onRefresh();
-            }, 2000);
+            }, 1000);
+          } else if (status.status === 'failed') {
+            notify.error(`Document processing failed: ${status.message || 'Unknown error'}`);
+            setTimeout(() => {
+              setProcessingTasks((prev) => {
+                const updated = { ...prev };
+                delete updated[taskId];
+                return updated;
+              });
+            }, 5000);
           }
         } catch (err) {
           console.error('Error fetching task status:', err);
         }
       }
-    }, 1000);
+    }, 2000); // Poll every 2 seconds instead of 1 to reduce load
 
     return () => clearInterval(interval);
   }, [processingTasks]);
@@ -328,6 +349,7 @@ const DocumentList = ({ onRefresh }) => {
       name: '',
       purpose: '',
       tags: '',
+      document_type: '',
       content: '',
       custom_metadata: '',
       chunk_size: 1000,
@@ -935,6 +957,9 @@ const DocumentList = ({ onRefresh }) => {
         formDataToSend.append('name', formData.name);
         formDataToSend.append('purpose', formData.purpose);
         formDataToSend.append('tags', formData.tags);
+        if (formData.document_type) {
+          formDataToSend.append('document_type', formData.document_type);
+        }
         formDataToSend.append('chunk_size', formData.chunk_size.toString());
         formDataToSend.append('chunk_overlap', formData.chunk_overlap.toString());
         formDataToSend.append('chunking_strategy', formData.chunking_strategy || 'semantic');
@@ -955,6 +980,7 @@ const DocumentList = ({ onRefresh }) => {
             name: formData.name,
             purpose: formData.purpose,
             tags: formData.tags,
+            document_type: formData.document_type || null,
             custom_metadata: formData.custom_metadata ? JSON.parse(formData.custom_metadata) : {},
           },
           content: formData.content,
@@ -975,22 +1001,24 @@ const DocumentList = ({ onRefresh }) => {
           [response.task_id]: {
             task_id: response.task_id,
             status: 'pending',
-            message: 'Processing...',
+            message: response.message || 'Processing...',
             progress: 0,
           },
         }));
-        notify.info('Document processing started');
+        notify.success('Document upload started! Processing in background...');
       }
 
+      // Close dialog immediately and reset form - don't wait for processing
       setCreateDialogOpen(false);
       setExpandedAdvice(null);
       resetForm();
-      await fetchDocuments();
-      onRefresh();
+      setSubmitting(false);
+      
+      // Don't fetch documents here - let the polling mechanism handle it when task completes
+      // This prevents UI blocking
     } catch (err) {
       notify.error('Failed to create document: ' + (err.response?.data?.detail || err.message));
       console.error('Error creating document:', err);
-    } finally {
       setSubmitting(false);
     }
   };
@@ -1025,6 +1053,7 @@ const DocumentList = ({ onRefresh }) => {
           name: formData.name,
           purpose: formData.purpose,
           tags: formData.tags,
+          document_type: formData.document_type || null,
           custom_metadata: formData.custom_metadata ? JSON.parse(formData.custom_metadata) : {},
         },
         chunk_size: formData.chunk_size,
@@ -1097,6 +1126,7 @@ const DocumentList = ({ onRefresh }) => {
       name: document.metadata.name || '',
       purpose: document.metadata.purpose || '',
       tags: document.metadata.tags || '',
+      document_type: document.metadata.document_type || '',
       content: document.content || '',
       custom_metadata: JSON.stringify(
         document.metadata.custom_metadata || {},
@@ -1404,7 +1434,21 @@ const DocumentList = ({ onRefresh }) => {
                         variant="outlined"
                       />
                       <Typography variant="caption" display="block" color="text.secondary">
-                        Size: {doc.metadata.chunk_size || 500}, Overlap: {doc.metadata.chunk_overlap || 50}
+                        {doc.metadata.chunking_strategy && (
+                          <>
+                            Strategy: {doc.metadata.chunking_strategy}
+                            <br />
+                          </>
+                        )}
+                        {doc.metadata.chunking_strategy !== 'lines' && (
+                          <>
+                            Size: {doc.metadata.chunk_size != null ? Number(doc.metadata.chunk_size) : 'N/A'}, 
+                            Overlap: {doc.metadata.chunk_overlap != null ? Number(doc.metadata.chunk_overlap) : 'N/A'}
+                          </>
+                        )}
+                        {doc.metadata.chunking_strategy === 'lines' && (
+                          <>One chunk per line</>
+                        )}
                       </Typography>
                     </TableCell>
                     <TableCell>
@@ -1492,6 +1536,28 @@ const DocumentList = ({ onRefresh }) => {
                                     <Typography variant="body2" component="span" sx={{ ml: 1 }}>
                                       {doc.metadata.content_length.toLocaleString()} chars, {doc.metadata.word_count?.toLocaleString() || Math.floor(doc.metadata.content_length / 5)} words
                                     </Typography>
+                                  </Box>
+                                )}
+                                {doc.metadata.embedding_model && (
+                                  <Box>
+                                    <Typography variant="caption" color="text.secondary">Embedding Model:</Typography>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.5 }}>
+                                      <Chip 
+                                        label={doc.metadata.embedding_model} 
+                                        size="small" 
+                                        sx={{ 
+                                          fontSize: '0.7rem',
+                                          height: '22px',
+                                          bgcolor: 'info.light',
+                                          color: 'info.contrastText'
+                                        }} 
+                                      />
+                                      {doc.metadata.embedding_dimension && (
+                                        <Typography variant="caption" color="text.secondary">
+                                          ({doc.metadata.embedding_dimension}D)
+                                        </Typography>
+                                      )}
+                                    </Box>
                                   </Box>
                                 )}
                               </Stack>
@@ -2118,6 +2184,26 @@ const DocumentList = ({ onRefresh }) => {
             disabled={submitting}
             sx={{ mb: 2 }}
           />
+          <FormControl fullWidth sx={{ mb: 2 }}>
+            <InputLabel>Document Type (optional)</InputLabel>
+            <Select
+              value={formData.document_type}
+              label="Document Type (optional)"
+              onChange={(e) => setFormData({ ...formData, document_type: e.target.value })}
+              disabled={submitting}
+            >
+              <MenuItem value="">Auto-detect (default)</MenuItem>
+              <MenuItem value="book">📚 Book</MenuItem>
+              <MenuItem value="definition">📖 Definition/Glossary</MenuItem>
+              <MenuItem value="article">📄 Article</MenuItem>
+              <MenuItem value="blog_post">📝 Blog Post</MenuItem>
+              <MenuItem value="poem">✍️ Poem</MenuItem>
+              <MenuItem value="unknown">❓ Unknown/Other</MenuItem>
+            </Select>
+            <FormHelperText>
+              Specify document type to help with chunking optimization. If not specified, the system will auto-detect.
+            </FormHelperText>
+          </FormControl>
           <TextField
             margin="dense"
             label="Content (leave empty to keep existing)"
@@ -2548,11 +2634,11 @@ const DocumentList = ({ onRefresh }) => {
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <Typography variant="h6">
               Chunks & Metadata
-              {selectedDocument && ` - ${selectedDocument.metadata.name}`}
+              {selectedDocument && ` - ${selectedDocument.metadata.name || selectedDocument.metadata.title || selectedDocument.metadata.document_name || 'Document'}`}
             </Typography>
             {selectedDocumentChunks && (
               <Chip 
-                label={`${selectedDocumentChunks.total} chunks`} 
+                label={`${selectedDocumentChunks.total || selectedDocumentChunks.chunks?.length || 0} chunks`} 
                 color="primary" 
                 variant="outlined"
               />

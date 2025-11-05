@@ -18,4 +18,5 @@ langchain-openai
 
 # Additional dependencies
 python-dotenv
+httpx
 
