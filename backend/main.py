@@ -15,6 +15,7 @@ import io
 import re
 from pathlib import Path
 from typing import Literal
+import os
 
 # Import production utilities
 from utils import (
@@ -52,12 +53,26 @@ app.add_middleware(
 # Initialize ChromaDB client
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
-# Initialize embedding function (MUST match chatbot's embedding model!)
-# Using sentence-transformers model that chatbot uses
-# Upgraded to all-mpnet-base-v2 for better accuracy (768 dimensions vs 384)
-embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="sentence-transformers/all-mpnet-base-v2"
+# Initialize embedding function
+# Supports both sentence-transformers and Gemini embeddings
+# Configure via environment variables:
+#   EMBEDDING_PROVIDER: "sentence-transformers" (default) or "gemini"
+#   EMBEDDING_MODEL: Model name (e.g., "all-mpnet-base-v2" or "models/embedding-001")
+#   GOOGLE_APPLICATION_CREDENTIALS: Path to GCP service account JSON key (for Gemini)
+#   GOOGLE_API_KEY: Google API key (alternative to service account)
+from embedding_utils import get_embedding_function
+
+embedding_provider = os.getenv("EMBEDDING_PROVIDER", "sentence-transformers")
+embedding_model = os.getenv("EMBEDDING_MODEL", None)
+service_account_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", None)
+
+embedding_function = get_embedding_function(
+    provider=embedding_provider,
+    model_name=embedding_model,
+    service_account_path=service_account_path
 )
+
+logger.info(f"Embedding provider: {embedding_provider}, model: {embedding_model or 'default'}")
 
 # In-memory storage for processing status
 processing_status: Dict[str, Dict[str, Any]] = {}

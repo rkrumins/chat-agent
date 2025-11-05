@@ -353,15 +353,14 @@ class RAGEngine:
                     continue
                 
                 # Extract document information from metadata
-                document_name = metadata.get("name", "Unknown Document")
-                document_id = result.get("id", "")
-                
-                # Skip chunks, only use document-level results for main retrieval
-                # (chunks are already embedded in the content)
+                # For chunks, use parent_name (clean document name) instead of adding chunk info to name
+                # The chunk information will be displayed separately in the UI
                 if metadata.get("is_chunk", False):
-                    # For chunks, we still include them but mark them appropriately
-                    parent_name = metadata.get("parent_name") or metadata.get("name", "Unknown")
-                    document_name = f"{parent_name} (chunk {metadata.get('chunk_number', '?')})"
+                    document_name = metadata.get("parent_name") or metadata.get("name", "Unknown Document")
+                else:
+                    document_name = metadata.get("name", "Unknown Document")
+                
+                document_id = result.get("id", "")
                 
                 retrieval_result = RetrievalResult(
                     content=content,

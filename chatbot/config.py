@@ -86,13 +86,35 @@ class ChatbotConfig:
     ]
     
     # ========================================================================
+    # EMBEDDING CONFIGURATION
+    # ========================================================================
+    
+    # Embedding Provider: "sentence-transformers" or "gemini"
+    # MUST match backend configuration!
+    EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "sentence-transformers")
+    
+    # Embedding Model (must match backend!)
+    # sentence-transformers: "all-mpnet-base-v2", "all-MiniLM-L6-v2"
+    # gemini: "models/embedding-001" or "models/text-embedding-004"
+    EMBEDDING_MODEL: str = os.getenv(
+        "EMBEDDING_MODEL",
+        "all-mpnet-base-v2" if os.getenv("EMBEDDING_PROVIDER", "sentence-transformers") == "sentence-transformers"
+        else "models/embedding-001"
+    )
+    
+    # GCP Service Account Key Path (for Gemini embeddings)
+    # Path to JSON key file for GCP service account authentication
+    # Alternative: Use GOOGLE_API_KEY environment variable
+    GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    
+    # ========================================================================
     # API KEYS (Set via environment variables for security)
     # ========================================================================
     
     # Groq API Key
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
     
-    # Google Gemini API Key
+    # Google Gemini API Key (for LLM and embeddings if not using service account)
     GOOGLE_API_KEY: Optional[str] = os.getenv("GOOGLE_API_KEY")
     
     # OpenAI API Key
@@ -111,6 +133,8 @@ class ChatbotConfig:
             "model_name": cls.MODEL_NAME,
             "temperature": cls.TEMPERATURE,
             "max_tokens": cls.MAX_TOKENS,
+            "embedding_provider": cls.EMBEDDING_PROVIDER,
+            "embedding_model": cls.EMBEDDING_MODEL,
             "max_results_per_collection": cls.MAX_RESULTS_PER_COLLECTION,
             "max_total_results": cls.MAX_TOTAL_RESULTS,
             "min_similarity_score": cls.MIN_SIMILARITY_SCORE,
@@ -129,13 +153,32 @@ class ChatbotConfig:
         if cls.LLM_PROVIDER not in ["groq", "gemini", "openai"]:
             errors.append(f"Invalid LLM_PROVIDER: {cls.LLM_PROVIDER}. Must be 'groq', 'gemini', or 'openai'")
         
+        # Validate embedding provider
+        if cls.EMBEDDING_PROVIDER not in ["sentence-transformers", "gemini"]:
+            errors.append(
+                f"Invalid EMBEDDING_PROVIDER: {cls.EMBEDDING_PROVIDER}. "
+                f"Must be 'sentence-transformers' or 'gemini'"
+            )
+        
         # Validate API keys
         if cls.LLM_PROVIDER == "groq" and not cls.GROQ_API_KEY:
             errors.append("GROQ_API_KEY is required when using Groq provider")
-        elif cls.LLM_PROVIDER == "gemini" and not cls.GOOGLE_API_KEY:
-            errors.append("GOOGLE_API_KEY is required when using Gemini provider")
+        elif cls.LLM_PROVIDER == "gemini" and not cls.GOOGLE_API_KEY and not cls.GOOGLE_APPLICATION_CREDENTIALS:
+            errors.append("GOOGLE_API_KEY or GOOGLE_APPLICATION_CREDENTIALS is required when using Gemini provider")
         elif cls.LLM_PROVIDER == "openai" and not cls.OPENAI_API_KEY:
             errors.append("OPENAI_API_KEY is required when using OpenAI provider")
+        
+        # Validate embedding authentication
+        if cls.EMBEDDING_PROVIDER == "gemini":
+            if not cls.GOOGLE_APPLICATION_CREDENTIALS and not cls.GOOGLE_API_KEY:
+                errors.append(
+                    "GOOGLE_APPLICATION_CREDENTIALS (service account path) or GOOGLE_API_KEY "
+                    "is required when using Gemini embedding provider"
+                )
+            elif cls.GOOGLE_APPLICATION_CREDENTIALS and not os.path.exists(cls.GOOGLE_APPLICATION_CREDENTIALS):
+                errors.append(
+                    f"GOOGLE_APPLICATION_CREDENTIALS file not found: {cls.GOOGLE_APPLICATION_CREDENTIALS}"
+                )
         
         # Validate temperature
         if not 0.0 <= cls.TEMPERATURE <= 1.0:

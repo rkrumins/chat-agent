@@ -27,6 +27,26 @@ TEMPERATURE = 0.7                           # 0.0-1.0 (Lower = accurate, Higher 
 MAX_TOKENS = 2048                           # Maximum response length
 ```
 
+### Embedding Configuration
+
+```python
+EMBEDDING_PROVIDER = "sentence-transformers"  # Options: "sentence-transformers", "gemini"
+EMBEDDING_MODEL = "all-mpnet-base-v2"        # Model name (varies by provider)
+GOOGLE_APPLICATION_CREDENTIALS = None        # Path to GCP service account JSON (for Gemini)
+```
+
+**Embedding Providers:**
+
+- **sentence-transformers** (default):
+  - `all-mpnet-base-v2` (768 dimensions, recommended)
+  - `all-MiniLM-L6-v2` (384 dimensions, faster)
+
+- **gemini**:
+  - `models/embedding-001` (768 dimensions)
+  - `models/text-embedding-004` (768 dimensions, latest)
+  - Requires GCP service account key or Google API key
+  - See `GEMINI_EMBEDDING_SETUP.md` for detailed setup
+
 **Available Models:**
 
 - **Groq:**
@@ -107,12 +127,22 @@ API keys should be set via environment variables for security:
 # Groq (recommended - free tier available)
 export GROQ_API_KEY=your_groq_api_key
 
-# Google Gemini
+# Google Gemini (for LLM)
+export GOOGLE_API_KEY=your_google_api_key
+
+# Google Gemini (for Embeddings - use service account or API key)
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+# OR
 export GOOGLE_API_KEY=your_google_api_key
 
 # OpenAI
 export OPENAI_API_KEY=your_openai_api_key
 ```
+
+**For Gemini Embeddings:**
+- **Recommended:** Use GCP service account key file (set `GOOGLE_APPLICATION_CREDENTIALS`)
+- **Alternative:** Use Google API key (set `GOOGLE_API_KEY`)
+- See `GEMINI_EMBEDDING_SETUP.md` for detailed instructions
 
 Get API keys:
 - **Groq**: https://console.groq.com/keys (FREE)

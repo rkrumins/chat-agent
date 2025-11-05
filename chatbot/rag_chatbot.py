@@ -9,6 +9,7 @@ via the backend API, supporting queries across multiple collections.
 import chainlit as cl
 import os
 import logging
+import re
 from typing import Optional, List
 from datetime import datetime
 
@@ -316,41 +317,144 @@ async def main(message: cl.Message):
         if rag_response.sources:
             response_text += "**📚 Sources used:**\n\n"
             
-            # Group sources by document (not collection) for better readability
+            # Helper function to clean document name (remove chunk info if embedded)
+            def clean_document_name(name):
+                """Remove chunk information from document name if present"""
+                # Remove patterns like " (chunk X)" or " (chunk X-Y)"
+                import re
+                cleaned = re.sub(r'\s*\(chunk\s+\d+[-\d]*\)', '', name, flags=re.IGNORECASE)
+                return cleaned.strip()
+            
+            # Helper function to clean snippet text
+            def clean_snippet_text(text):
+                """Clean snippet text by removing artifacts and formatting"""
+                if not text:
+                    return ""
+                
+                # Remove excessive dots/periods (like "................................")
+                text = re.sub(r'\.{4,}', '', text)
+                
+                # Remove page number patterns (like " 19" or " 23" at end of lines)
+                lines = text.split('\n')
+                cleaned_lines = []
+                for line in lines:
+                    # Remove trailing page numbers (numbers at end of line with spaces)
+                    line = re.sub(r'\s+\d{1,3}\s*$', '', line)
+                    # Remove lines that are mostly dots, dashes, underscores, or whitespace
+                    if line.strip() and not re.match(r'^[\s\.\-_=]+$', line):
+                        # Clean up the line
+                        cleaned_line = line.strip()
+                        # Remove excessive spaces
+                        cleaned_line = re.sub(r'\s+', ' ', cleaned_line)
+                        if cleaned_line:
+                            cleaned_lines.append(cleaned_line)
+                
+                # Take first meaningful lines (up to 2 lines)
+                if cleaned_lines:
+                    text = ' '.join(cleaned_lines[:2])  # Join lines with space
+                else:
+                    text = ""
+                
+                # Limit length and ensure it ends properly
+                if len(text) > 180:
+                    # Try to cut at word boundary
+                    text = text[:177]
+                    last_space = text.rfind(' ')
+                    if last_space > 150:  # Only use word boundary if not too short
+                        text = text[:last_space]
+                    text = text.rstrip() + "..."
+                
+                return text.strip()
+            
+            # Group sources by document and collect chunk information
             doc_sources = {}
             for source in rag_response.sources:
-                doc_key = f"{source.document_name}_{source.collection}"
+                # Get clean document name from metadata (parent_name or name)
+                # This avoids the chunk info that might be embedded in document_name
+                clean_doc_name = source.metadata.get("parent_name") or source.metadata.get("name") or clean_document_name(source.document_name)
+                doc_key = f"{clean_doc_name}_{source.collection}"
+                
+                # Collect chunk number if available
+                chunk_num = source.metadata.get("chunk_number") or source.metadata.get("chunk_index")
+                
                 if doc_key not in doc_sources:
                     doc_sources[doc_key] = {
-                        'document_name': source.document_name,
+                        'document_name': clean_doc_name,
                         'collection': source.collection,
                         'version': source.metadata.get("version", ""),
-                        'similarity': source.similarity_score,
-                        'snippet': source.content[:250].strip()  # Slightly longer snippet
+                        'similarity': source.similarity_score,  # Will track best similarity
+                        'chunks': [],  # List of chunk numbers
+                        'best_snippet': source.content[:250].strip()  # Best snippet for preview
                     }
+                
+                # Update similarity if this source has higher relevance
+                if source.similarity_score > doc_sources[doc_key]['similarity']:
+                    doc_sources[doc_key]['similarity'] = source.similarity_score
+                    doc_sources[doc_key]['best_snippet'] = source.content[:250].strip()
+                
+                # Collect chunk number if available
+                if chunk_num is not None:
+                    doc_sources[doc_key]['chunks'].append(int(chunk_num))
+            
+            # Format chunk ranges (e.g., [9, 10, 75, 76] -> "chunks 9-10, 75-76")
+            def format_chunk_ranges(chunk_numbers):
+                """Format chunk numbers into ranges for better readability"""
+                if not chunk_numbers:
+                    return ""
+                
+                sorted_chunks = sorted(set(chunk_numbers))
+                ranges = []
+                start = sorted_chunks[0]
+                end = sorted_chunks[0]
+                
+                for chunk in sorted_chunks[1:]:
+                    if chunk == end + 1:
+                        # Consecutive chunk
+                        end = chunk
+                    else:
+                        # Gap found, save current range
+                        if start == end:
+                            ranges.append(str(start))
+                        else:
+                            ranges.append(f"{start}-{end}")
+                        start = chunk
+                        end = chunk
+                
+                # Add last range
+                if start == end:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{end}")
+                
+                return ", ".join(ranges)
             
             # Display unique documents (sorted by relevance)
             sorted_docs = sorted(doc_sources.items(), key=lambda x: x[1]['similarity'], reverse=True)
             
             for i, (doc_key, doc_info) in enumerate(sorted_docs[:5], 1):  # Show top 5 documents
-                version_str = f" (v{doc_info['version']})" if doc_info['version'] else ""
+                # Format document name with version
+                doc_name = doc_info['document_name']
+                version_str = f" v{doc_info['version']}" if doc_info['version'] else ""
                 collection_note = f" from *{doc_info['collection']}*" if len(rag_response.collections_searched) > 1 else ""
                 
-                response_text += f"{i}. **{doc_info['document_name']}**{version_str}{collection_note}\n"
+                # Format chunk information
+                chunk_ranges = format_chunk_ranges(doc_info['chunks'])
+                if chunk_ranges:
+                    chunk_info = f" (chunks {chunk_ranges})"
+                else:
+                    chunk_info = ""
+                
+                # Build the source line
+                response_text += f"{i}. **{doc_name}**{chunk_info}{version_str}{collection_note}\n"
                 
                 # Add snippet if meaningful
-                snippet = doc_info['snippet']
-                if len(snippet) > 50:  # Only show if substantial
-                    # Clean up snippet - remove metadata prefixes
-                    lines = snippet.split('\n')
-                    clean_lines = [l for l in lines if not l.strip().startswith('[') or 'DOCUMENT' not in l.upper()]
-                    snippet = '\n'.join(clean_lines[:3])[:200]  # First 3 lines, max 200 chars
-                    if snippet.strip():
-                        response_text += f"   *\"{snippet}"
-                        if len(doc_info['snippet']) > 200:
-                            response_text += "...\"*\n"
-                        else:
-                            response_text += "\"*\n"
+                raw_snippet = doc_info['best_snippet']
+                if len(raw_snippet) > 30:  # Only show if substantial
+                    # Clean snippet text
+                    snippet = clean_snippet_text(raw_snippet)
+                    
+                    if snippet:
+                        response_text += f"   *\"{snippet}\"*\n"
                 
                 response_text += "\n"
         
