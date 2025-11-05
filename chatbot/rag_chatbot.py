@@ -50,27 +50,16 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================================================
 
-# Backend API Configuration
-BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8000")
-BACKEND_API_TIMEOUT = int(os.getenv("BACKEND_API_TIMEOUT", "30"))
+# Import configuration from config.py
+from config import config
 
-# LLM Configuration
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
-MODEL_NAME = os.getenv("MODEL_NAME", "mixtral-8x7b-32768")
-TEMPERATURE = float(os.getenv("TEMPERATURE", "0.1"))
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
-
-# RAG Configuration
-MAX_RESULTS_PER_COLLECTION = int(os.getenv("MAX_RESULTS_PER_COLLECTION", "8"))  # Reduced from 10 to 8
-MAX_TOTAL_RESULTS = int(os.getenv("MAX_TOTAL_RESULTS", "30"))  # Reduced from 50 to 30
-MIN_SIMILARITY_SCORE = float(os.getenv("MIN_SIMILARITY_SCORE", "0.3"))
-ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
-ENABLE_QUERY_REWRITING = os.getenv("ENABLE_QUERY_REWRITING", "true").lower() == "true"
-ENABLE_MULTI_QUERY = os.getenv("ENABLE_MULTI_QUERY", "true").lower() == "true"
-
-# Default collections (comma-separated, empty = all collections)
-DEFAULT_COLLECTIONS = os.getenv("DEFAULT_COLLECTIONS", "").split(",")
-DEFAULT_COLLECTIONS = [c.strip() for c in DEFAULT_COLLECTIONS if c.strip()]
+# Validate configuration on import
+config_errors = config.validate()
+if config_errors:
+    logger.warning("Configuration validation errors:")
+    for error in config_errors:
+        logger.warning(f"  - {error}")
+    logger.warning("Some features may not work correctly. Please fix the configuration errors.")
 
 
 # ============================================================================
@@ -79,48 +68,48 @@ DEFAULT_COLLECTIONS = [c.strip() for c in DEFAULT_COLLECTIONS if c.strip()]
 
 def get_llm(provider: str = None):
     """Get LLM instance based on provider"""
-    provider = provider or LLM_PROVIDER
+    provider = provider or config.LLM_PROVIDER
     
     if provider == "groq":
         if not ChatGroq:
             raise ValueError("Groq not installed. Run: pip install langchain-groq")
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key = config.GROQ_API_KEY
         if not api_key:
-            raise ValueError("GROQ_API_KEY not set")
+            raise ValueError("GROQ_API_KEY not set. Please set it in your environment or config.py")
         return ChatGroq(
             groq_api_key=api_key,
-            model_name=MODEL_NAME,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
+            model_name=config.MODEL_NAME,
+            temperature=config.TEMPERATURE,
+            max_tokens=config.MAX_TOKENS,
             timeout=30.0
         )
     
     elif provider == "gemini":
         if not ChatGoogleGenerativeAI:
             raise ValueError("Google Gemini not installed. Run: pip install langchain-google-genai")
-        api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = config.GOOGLE_API_KEY
         if not api_key:
-            raise ValueError("GOOGLE_API_KEY not set")
-        model = os.getenv("MODEL_NAME", "gemini-pro")
+            raise ValueError("GOOGLE_API_KEY not set. Please set it in your environment or config.py")
+        model = config.MODEL_NAME
         return ChatGoogleGenerativeAI(
             google_api_key=api_key,
             model=model,
-            temperature=TEMPERATURE,
-            max_output_tokens=MAX_TOKENS
+            temperature=config.TEMPERATURE,
+            max_output_tokens=config.MAX_TOKENS
         )
     
     elif provider == "openai":
         if not ChatOpenAI:
             raise ValueError("OpenAI not installed. Run: pip install langchain-openai")
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = config.OPENAI_API_KEY
         if not api_key:
-            raise ValueError("OPENAI_API_KEY not set")
-        model = os.getenv("MODEL_NAME", "gpt-4-turbo-preview")
+            raise ValueError("OPENAI_API_KEY not set. Please set it in your environment or config.py")
+        model = config.MODEL_NAME
         return ChatOpenAI(
             openai_api_key=api_key,
             model_name=model,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
+            temperature=config.TEMPERATURE,
+            max_tokens=config.MAX_TOKENS,
             timeout=30.0
         )
     
@@ -169,37 +158,37 @@ Ask me anything about your documents!"""
     
     try:
         # Initialize LLM
-        await cl.Message(content=f"🔄 Initializing {LLM_PROVIDER.upper()} LLM...").send()
+        await cl.Message(content=f"🔄 Initializing {config.LLM_PROVIDER.upper()} LLM...").send()
         llm = get_llm()
         
         # Initialize VectorDB client
-        await cl.Message(content=f"🔄 Connecting to Vector Database API ({BACKEND_API_URL})...").send()
+        await cl.Message(content=f"🔄 Connecting to Vector Database API ({config.BACKEND_API_URL})...").send()
         vector_db_client = VectorDBClient(
-            api_base_url=BACKEND_API_URL,
-            timeout=BACKEND_API_TIMEOUT
+            api_base_url=config.BACKEND_API_URL,
+            timeout=config.BACKEND_API_TIMEOUT
         )
         
         # Initialize RAG Engine
         rag_engine = RAGEngine(
             vector_db_client=vector_db_client,
             llm=llm,
-            max_results_per_collection=MAX_RESULTS_PER_COLLECTION,
-            max_total_results=MAX_TOTAL_RESULTS,
-            min_similarity_score=MIN_SIMILARITY_SCORE,
-            enable_reranking=ENABLE_RERANKING,
+            max_results_per_collection=config.MAX_RESULTS_PER_COLLECTION,
+            max_total_results=config.MAX_TOTAL_RESULTS,
+            min_similarity_score=config.MIN_SIMILARITY_SCORE,
+            enable_reranking=config.ENABLE_RERANKING,
             enable_conversation=True,
-            enable_query_rewriting=ENABLE_QUERY_REWRITING,
-            enable_multi_query=ENABLE_MULTI_QUERY
+            enable_query_rewriting=config.ENABLE_QUERY_REWRITING,
+            enable_multi_query=config.ENABLE_MULTI_QUERY
         )
         
         # Initialize Session Manager
         session_manager = RAGSessionManager(rag_engine)
         
         # Set default collections if specified
-        if DEFAULT_COLLECTIONS:
-            session_manager.set_default_collections(DEFAULT_COLLECTIONS)
+        if config.DEFAULT_COLLECTIONS:
+            session_manager.set_default_collections(config.DEFAULT_COLLECTIONS)
             await cl.Message(
-                content=f"📚 Default collections set to: {', '.join(DEFAULT_COLLECTIONS)}"
+                content=f"📚 Default collections set to: {', '.join(config.DEFAULT_COLLECTIONS)}"
             ).send()
         
         # Store in user session
@@ -207,7 +196,7 @@ Ask me anything about your documents!"""
         cl.user_session.set("rag_engine", rag_engine)
         cl.user_session.set("session_manager", session_manager)
         cl.user_session.set("llm", llm)
-        cl.user_session.set("selected_collections", DEFAULT_COLLECTIONS if DEFAULT_COLLECTIONS else None)
+        cl.user_session.set("selected_collections", config.DEFAULT_COLLECTIONS if config.DEFAULT_COLLECTIONS else None)
         
         # Get collection info
         try:
@@ -223,14 +212,14 @@ Ask me anything about your documents!"""
         ready_message = f"""✅ **Ready!**
 
 **Configuration:**
-- **LLM Provider:** {LLM_PROVIDER.upper()}
-- **Model:** {MODEL_NAME}
-- **Backend API:** {BACKEND_API_URL}
-- **Temperature:** {TEMPERATURE} (optimized for accuracy)
-- **Retrieval:** Max {MAX_RESULTS_PER_COLLECTION} per collection, {MAX_TOTAL_RESULTS} total
+- **LLM Provider:** {config.LLM_PROVIDER.upper()}
+- **Model:** {config.MODEL_NAME}
+- **Backend API:** {config.BACKEND_API_URL}
+- **Temperature:** {config.TEMPERATURE} (optimized for accuracy)
+- **Retrieval:** Max {config.MAX_RESULTS_PER_COLLECTION} per collection, {config.MAX_TOTAL_RESULTS} total
 - **Collections Available:** {collection_count}
 - **Total Documents:** {total_docs}
-- **Selected Collections:** {', '.join(DEFAULT_COLLECTIONS) if DEFAULT_COLLECTIONS else 'All collections'}
+- **Selected Collections:** {', '.join(config.DEFAULT_COLLECTIONS) if config.DEFAULT_COLLECTIONS else 'All collections'}
 
 """
         
@@ -247,7 +236,7 @@ Ask me anything about your documents!"""
 **Error:** {str(e)}
 
 **Troubleshooting:**
-1. Verify backend API is running at: `{BACKEND_API_URL}`
+1. Verify backend API is running at: `{config.BACKEND_API_URL}`
 2. Check API keys are set in environment variables
 3. Verify backend has collections with documents
 4. Check logs for detailed error information"""
@@ -448,18 +437,18 @@ async def handle_command(command: str):
         info_text = f"""**⚙️ Current Configuration:**
 
 **LLM Settings:**
-- Provider: {LLM_PROVIDER.upper()}
-- Model: {MODEL_NAME}
-- Temperature: {TEMPERATURE} (low for accuracy)
-- Max Tokens: {MAX_TOKENS}
+- Provider: {config.LLM_PROVIDER.upper()}
+- Model: {config.MODEL_NAME}
+- Temperature: {config.TEMPERATURE} (low for accuracy)
+- Max Tokens: {config.MAX_TOKENS}
 
 **Retrieval Settings:**
-- Max Results per Collection: {MAX_RESULTS_PER_COLLECTION}
-- Max Total Results: {MAX_TOTAL_RESULTS}
-- Min Similarity Score: {MIN_SIMILARITY_SCORE}
-- Reranking: {'✅ Enabled' if ENABLE_RERANKING else '❌ Disabled'}
-- Query Rewriting: {'✅ Enabled' if ENABLE_QUERY_REWRITING else '❌ Disabled'}
-- Multi-Query Retrieval: {'✅ Enabled' if ENABLE_MULTI_QUERY else '❌ Disabled'}
+- Max Results per Collection: {config.MAX_RESULTS_PER_COLLECTION}
+- Max Total Results: {config.MAX_TOTAL_RESULTS}
+- Min Similarity Score: {config.MIN_SIMILARITY_SCORE}
+- Reranking: {'✅ Enabled' if config.ENABLE_RERANKING else '❌ Disabled'}
+- Query Rewriting: {'✅ Enabled' if config.ENABLE_QUERY_REWRITING else '❌ Disabled'}
+- Multi-Query Retrieval: {'✅ Enabled' if config.ENABLE_MULTI_QUERY else '❌ Disabled'}
 
 **Accuracy Features:**
 - ✅ Advanced Reranking (multi-factor scoring)
@@ -468,8 +457,8 @@ async def handle_command(command: str):
 - ✅ Conversation Memory (context-aware follow-ups)
 
 **Backend API:**
-- URL: {BACKEND_API_URL}
-- Timeout: {BACKEND_API_TIMEOUT}s
+- URL: {config.BACKEND_API_URL}
+- Timeout: {config.BACKEND_API_TIMEOUT}s
 
 **Selected Collections:**
 - {', '.join(selected_collections) if selected_collections else 'All collections (none selected)'}
