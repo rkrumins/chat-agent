@@ -60,6 +60,28 @@ else
     deactivate
 fi
 
+# Start Ingestion Service
+if check_port 8002; then
+    echo "⚠️  Ingestion Service already running on port 8002"
+else
+    echo "Starting Ingestion Service..."
+    cd "$SCRIPT_DIR/ingestion-service"
+    
+    if [ ! -d "venv" ]; then
+        echo "Creating Ingestion Service virtual environment..."
+        $PYTHON_CMD -m venv venv
+        source venv/bin/activate
+        pip install -q -r requirements.txt
+    else
+        source venv/bin/activate
+    fi
+    
+    $PYTHON_CMD -m uvicorn main:app --reload --host 0.0.0.0 --port 8002 &
+    INGESTION_PID=$!
+    echo "✓ Ingestion Service started (PID: $INGESTION_PID)"
+    deactivate
+fi
+
 # Start Frontend
 if check_port 3000; then
     echo "⚠️  Frontend already running on port 3000"
@@ -76,6 +98,7 @@ else
     FRONTEND_PID=$!
     echo "✓ Frontend started (PID: $FRONTEND_PID)"
 fi
+
 
 # Start Chatbot
 if check_port 8001; then
@@ -106,13 +129,15 @@ echo ""
 echo "Python version: $($PYTHON_CMD --version)"
 echo ""
 echo "Access the application:"
-echo "  Frontend: http://localhost:3000"
-echo "  Backend:  http://localhost:8000"
-echo "  API Docs: http://localhost:8000/docs"
-echo "  Chatbot:  http://localhost:8001 (RAG Module with Multi-Collection Support)"
+echo "  Frontend:  http://localhost:3000"
+echo "  Backend:   http://localhost:8000"
+echo "  API Docs:  http://localhost:8000/docs"
+echo "  Ingestion: http://localhost:8002 (Document Processing Microservice)"
+echo "  Chatbot:   http://localhost:8001 (RAG Module with Multi-Collection Support)"
 echo ""
 echo "Press Ctrl+C to stop all services"
 echo ""
+
 
 # Wait for user interrupt
 wait

@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+chromadb
+pydantic
+python-multipart
+aiofiles
+python-dotenv
+PyPDF2
+python-docx
+openpyxl
+numpy<2.0
+sentence-transformers
+google-generativeai
+google-auth
+sqlalchemy
+httpx

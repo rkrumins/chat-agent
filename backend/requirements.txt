@@ -12,3 +12,5 @@ numpy<2.0  # Fix NumPy compatibility with PyTorch
 sentence-transformers  # Required for sentence-transformers embeddings
 google-generativeai  # Required for Gemini embeddings
 google-auth  # Required for GCP service account authentication
+httpx  # For async HTTP calls to ingestion service
+sqlalchemy  # For database access

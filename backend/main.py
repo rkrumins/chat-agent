@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -16,8 +16,53 @@ import re
 from pathlib import Path
 from typing import Literal
 import os
+import sys
 
-# Import production utilities
+# Add parent directory to path for config imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Microservices components are loaded lazily to avoid blocking the event loop
+# The config module creates SQLAlchemy connections that conflict with uvicorn's async handling
+_microservices_loaded = False
+_get_db = None
+_ingestion_client = None
+_file_storage = None
+
+
+def get_microservices():
+    """
+    Lazy loader for microservices components.
+    Returns (get_db, ingestion_client, file_storage, enabled).
+    Only imports on first call to avoid blocking during startup.
+    """
+    global _microservices_loaded, _get_db, _ingestion_client, _file_storage
+    
+    if not _microservices_loaded:
+        try:
+            from config import get_db as db_getter, IngestionJob, JobStatus as DBJobStatus, init_db, ensure_directories
+            from ingestion_client import IngestionClient, FileStorageManager
+            
+            # Initialize database and directories now (at first use, not import time)
+            init_db()
+            ensure_directories()
+            
+            _get_db = db_getter
+            _ingestion_client = IngestionClient()
+            _file_storage = FileStorageManager()
+            _microservices_loaded = True
+            logger.info("Microservices components loaded successfully")
+        except ImportError as e:
+            logger.warning(f"Microservices not available: {e}")
+            _microservices_loaded = True  # Mark as loaded to avoid retry
+    
+    return _get_db, _ingestion_client, _file_storage, (_get_db is not None)
+
+
+# For backwards compatibility, these will be None until first use
+MICROSERVICES_ENABLED = None  # Will be determined on first use
+get_db = None  # Use get_microservices() instead
+
+
 from utils import (
     validate_file_size, validate_content, validate_chunking_parameters,
     validate_chunk_quality, calculate_content_hash, detect_duplicate_content,
@@ -178,7 +223,22 @@ class ProcessingStatusResponse(BaseModel):
     updated_at: str
 
 
-# File parsing functions
+class CallbackPayload(BaseModel):
+    """Payload received from ingestion service for status updates."""
+    job_id: str
+    status: str
+    progress: int
+    message: Optional[str] = None
+    error: Optional[str] = None
+    document_id: Optional[str] = None
+    collection_name: Optional[str] = None
+    document_type: Optional[str] = None
+    chunks_created: Optional[int] = None
+    timestamp: Optional[datetime] = None
+
+
+# File parsing functions (kept for legacy fallback mode)
+
 def parse_pdf(file_content: bytes) -> str:
     """Extract text from PDF file"""
     if PdfReader is None:
@@ -1666,7 +1726,6 @@ async def create_document(
 
 @app.post("/collections/{collection_name}/documents/upload")
 async def upload_document(
-    background_tasks: BackgroundTasks,
     collection_name: str,
     file: UploadFile = File(...),
     name: str = Form(...),
@@ -1679,9 +1738,10 @@ async def upload_document(
     chunk_separator: str = Form(None),
     max_chunks: int = Form(None),
     custom_metadata: str = Form("{}"),
-    create_new_version: bool = Form(False)
+    create_new_version: bool = Form(False),
+    background_tasks: BackgroundTasks = None
 ):
-    """Upload and process a document file with validation"""
+    """Upload and process a document file via ingestion microservice"""
     try:
         # Step 1: Validate file size (quick check)
         file_content = await file.read()
@@ -1708,9 +1768,7 @@ async def upload_document(
         if not is_valid:
             raise HTTPException(status_code=400, detail=error_msg)
         
-        # NOTE: File parsing and content validation are now done in the background task
-        # to avoid blocking the UI. Only quick validations (size, extension) are done here.
-        
+        # Get or create collection
         collection = chroma_client.get_or_create_collection(
             name=collection_name,
             embedding_function=embedding_function
@@ -1725,17 +1783,6 @@ async def upload_document(
         document_id = str(uuid.uuid4())
         task_id = str(uuid.uuid4())
         
-        # Initialize processing status
-        processing_status[task_id] = {
-            "task_id": task_id,
-            "document_id": document_id,
-            "status": ProcessingStatus.PENDING,
-            "message": "Document queued for processing",
-            "progress": 0,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        
         # Parse custom metadata
         try:
             custom_meta = json.loads(custom_metadata) if custom_metadata else {}
@@ -1749,14 +1796,13 @@ async def upload_document(
             "tags": tags,
             "filename": sanitized_filename,
             "original_filename": file.filename,
-            "file_type": Path(sanitized_filename).suffix.lower(),
+            "file_type": extension,
             "file_size": file_size,
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
             **custom_meta
         }
         
-        # Queue background processing
         # Convert max_chunks to int if provided
         max_chunks_int = None
         if max_chunks is not None:
@@ -1765,31 +1811,106 @@ async def upload_document(
             except (ValueError, TypeError):
                 max_chunks_int = None
         
-        # Store chunking parameters in metadata
-        metadata["chunking_strategy"] = chunking_strategy or "semantic"
-        if chunk_separator:
-            metadata["chunk_separator"] = chunk_separator
-        if max_chunks_int:
-            metadata["max_chunks"] = max_chunks_int
+        # Check if microservices are enabled (lazy load on first use)
+        db_getter, ingestion_client, file_storage, microservices_enabled = get_microservices()
         
-        # Queue background processing - file_content is passed instead of parsed content
-        # This allows parsing to happen in the background, making the upload non-blocking
-        background_tasks.add_task(
-            process_document_async,
-            task_id=task_id,
-            collection_name=collection_name,
-            document_id=document_id,
-            content=None,  # content will be None, indicating we need to parse file_content
-            metadata=metadata,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            chunking_strategy=chunking_strategy or "semantic",
-            chunk_separator=chunk_separator if chunk_separator and chunk_separator != "null" else None,
-            max_chunks=max_chunks_int,
-            version=version,
-            file_content=file_content,  # Pass raw file content for background parsing
-            filename=sanitized_filename  # Pass filename for parsing
-        )
+        if microservices_enabled:
+            # Use the new microservices architecture
+            db = next(db_getter())
+            
+            try:
+                # Store file using content-addressed storage
+                stored_file, collection_link, is_new = file_storage.store_file(
+                    file_content=file_content,
+                    original_filename=sanitized_filename,
+                    collection_name=collection_name,
+                    document_id=document_id,
+                    db=db
+                )
+                
+                # Get the absolute file path for ingestion
+                file_path = str(file_storage.get_file_path(stored_file))
+                
+                # Initialize processing status (for backwards compatibility with frontend)
+                processing_status[task_id] = {
+                    "task_id": task_id,
+                    "document_id": document_id,
+                    "status": ProcessingStatus.PENDING,
+                    "message": "Document queued for ingestion",
+                    "progress": 0,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+                
+                # Trigger ingestion via REST API
+                try:
+                    result = await ingestion_client.trigger_ingestion(
+                        job_id=task_id,
+                        file_id=stored_file.id,
+                        file_path=file_path,
+                        collection_name=collection_name,
+                        document_id=document_id,
+                        metadata=metadata,
+                        chunk_size=chunk_size,
+                        chunk_overlap=chunk_overlap,
+                        chunking_strategy=chunking_strategy or "semantic",
+                        chunk_separator=chunk_separator if chunk_separator and chunk_separator != "null" else None,
+                        max_chunks=max_chunks_int,
+                        document_type=document_type,
+                        version=version,
+                        create_new_version=create_new_version
+                    )
+                    logger.info(f"Ingestion triggered for document {document_id}: {result}")
+                except Exception as e:
+                    logger.error(f"Failed to trigger ingestion: {e}")
+                    # Update status to failed
+                    processing_status[task_id]["status"] = ProcessingStatus.FAILED
+                    processing_status[task_id]["message"] = f"Failed to trigger ingestion: {str(e)}"
+                    raise HTTPException(status_code=500, detail=f"Failed to trigger ingestion service: {str(e)}")
+                
+            finally:
+                db.close()
+
+        else:
+            # Fall back to legacy BackgroundTasks approach
+            logger.warning("Microservices not enabled, using legacy BackgroundTasks")
+            
+            # Initialize processing status
+            processing_status[task_id] = {
+                "task_id": task_id,
+                "document_id": document_id,
+                "status": ProcessingStatus.PENDING,
+                "message": "Document queued for processing",
+                "progress": 0,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }
+            
+            # Store chunking parameters in metadata
+            metadata["chunking_strategy"] = chunking_strategy or "semantic"
+            if chunk_separator:
+                metadata["chunk_separator"] = chunk_separator
+            if max_chunks_int:
+                metadata["max_chunks"] = max_chunks_int
+            
+            # Queue background processing
+            if background_tasks:
+                background_tasks.add_task(
+                    process_document_async,
+                    task_id=task_id,
+                    collection_name=collection_name,
+                    document_id=document_id,
+                    content=None,
+                    metadata=metadata,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    chunking_strategy=chunking_strategy or "semantic",
+                    chunk_separator=chunk_separator if chunk_separator and chunk_separator != "null" else None,
+                    max_chunks=max_chunks_int,
+                    version=version,
+                    file_content=file_content,
+                    filename=sanitized_filename
+                )
         
         return {
             "document_id": document_id,
@@ -1797,8 +1918,10 @@ async def upload_document(
             "version": version,
             "message": f"Document queued for processing (version {version})",
             "status": ProcessingStatus.PENDING,
-            "filename": file.filename
+            "filename": file.filename,
+            "microservices_enabled": microservices_enabled
         }
+
     except HTTPException:
         raise
     except Exception as e:
@@ -2122,7 +2245,42 @@ async def list_tasks(status: Optional[ProcessingStatus] = None):
     return {"tasks": tasks, "total": len(tasks)}
 
 
-# Search endpoint
+@app.post("/api/jobs/{job_id}/callback")
+async def receive_job_callback(job_id: str, payload: CallbackPayload):
+    """
+    Receive status callback from ingestion service.
+    Updates the in-memory processing_status dict for backwards compatibility.
+    """
+    logger.info(f"Received callback for job {job_id}: {payload.status} ({payload.progress}%)")
+    
+    # Map ingestion service status to our ProcessingStatus enum
+    status_map = {
+        "queued": ProcessingStatus.PENDING,
+        "processing": ProcessingStatus.PROCESSING,
+        "completed": ProcessingStatus.COMPLETED,
+        "failed": ProcessingStatus.FAILED
+    }
+    
+    mapped_status = status_map.get(payload.status.lower(), ProcessingStatus.PROCESSING)
+    
+    # Update in-memory status (for backwards compatibility with frontend)
+    processing_status[job_id] = {
+        "task_id": job_id,
+        "document_id": payload.document_id or "",
+        "status": mapped_status,
+        "message": payload.message or "",
+        "progress": payload.progress,
+        "created_at": processing_status.get(job_id, {}).get("created_at", datetime.utcnow().isoformat()),
+        "updated_at": payload.timestamp.isoformat() if payload.timestamp else datetime.utcnow().isoformat(),
+        "chunk_count": payload.chunks_created,
+        "document_type": payload.document_type,
+        "error": payload.error
+    }
+    
+    return {"status": "received", "job_id": job_id}
+
+
+
 
 @app.post("/collections/{collection_name}/search")
 async def search_documents(
