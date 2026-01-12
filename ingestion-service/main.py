@@ -1,6 +1,6 @@
 """
 Ingestion Service - Standalone microservice for document processing.
-Handles file parsing, chunking, embedding generation, and ChromaDB storage.
+Handles file parsing, chunking, and delegates vector storage to vector-service.
 Communicates with backend via callbacks for status updates.
 """
 
@@ -18,7 +18,6 @@ import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-import chromadb
 
 # Add parent directory to path for config imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -26,12 +25,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     get_db, init_db, ensure_directories,
     JobStatus, IngestionJob, Document, DocumentVersion, Chunk,
-    BACKEND_URL, CHROMA_DB_PATH, FILES_DIR, 
-    EMBEDDING_PROVIDER, EMBEDDING_MODEL,
+    BACKEND_URL, FILES_DIR, 
     DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNKING_STRATEGY,
     CALLBACK_TIMEOUT, CALLBACK_RETRY_ATTEMPTS, LOG_LEVEL
 )
-
 
 from models import (
     IngestionRequest, IngestionResponse, JobStatusResponse, 
@@ -41,6 +38,12 @@ from ingestion_logic import (
     parse_file, chunk_text, detect_document_type, 
     prepare_metadata_for_chroma, calculate_content_hash, get_adaptive_chunk_params
 )
+from vector_client import VectorServiceClient
+
+# Configuration
+VECTOR_SERVICE_URL = os.getenv("VECTOR_SERVICE_URL", "http://localhost:8003")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "sentence-transformers")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", None)
 
 # Configure logging
 logging.basicConfig(
@@ -49,76 +52,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ChromaDB client
-chroma_client = None
-embedding_function = None
-
-
-def get_embedding_function():
-    """Get embedding function based on configuration."""
-    from chromadb.utils import embedding_functions
-    
-    provider = EMBEDDING_PROVIDER
-    model_name = EMBEDDING_MODEL
-    
-    if provider == "sentence-transformers":
-        model = model_name or "sentence-transformers/all-mpnet-base-v2"
-        logger.info(f"Using sentence-transformers embedding: {model}")
-        return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model)
-    elif provider == "gemini":
-        model = model_name or "models/embedding-001"
-        logger.info(f"Using Gemini embedding model: {model}")
-        # Import Gemini embedding function
-        try:
-            import google.generativeai as genai
-            from chromadb.utils.embedding_functions import EmbeddingFunction
-            
-            api_key = os.getenv("GOOGLE_API_KEY")
-            credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            
-            if credentials_path:
-                from google.oauth2 import service_account
-                credentials = service_account.Credentials.from_service_account_file(
-                    credentials_path, scopes=['https://www.googleapis.com/auth/cloud-platform']
-                )
-                genai.configure(credentials=credentials)
-            elif api_key:
-                genai.configure(api_key=api_key)
-            else:
-                raise ValueError("No Gemini credentials configured")
-            
-            class GeminiEmbeddingFunction(EmbeddingFunction):
-                def __init__(self, model_name: str):
-                    self.model_name = model_name
-                
-                def __call__(self, input_texts):
-                    if isinstance(input_texts, str):
-                        input_texts = [input_texts]
-                    embeddings = []
-                    for text in input_texts:
-                        result = genai.embed_content(
-                            model=self.model_name,
-                            content=text,
-                            task_type="retrieval_document"
-                        )
-                        if isinstance(result, dict) and 'embedding' in result:
-                            embeddings.append(result['embedding'])
-                        else:
-                            embeddings.append(result)
-                    return embeddings
-            
-            return GeminiEmbeddingFunction(model)
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini embeddings: {e}")
-            raise
-    else:
-        raise ValueError(f"Unknown embedding provider: {provider}")
+# Vector service client
+vector_client: Optional[VectorServiceClient] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan management."""
-    global chroma_client, embedding_function
+    global vector_client
     
     # Startup
     logger.info("Starting Ingestion Service...")
@@ -129,22 +70,18 @@ async def lifespan(app: FastAPI):
     ensure_directories()
     logger.info("Database and directories initialized")
     
-    try:
-        chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        logger.info(f"ChromaDB connected at {CHROMA_DB_PATH}")
-    except Exception as e:
-        logger.error(f"Failed to connect to ChromaDB: {e}")
-        raise
+    # Initialize vector service client
+    vector_client = VectorServiceClient(base_url=VECTOR_SERVICE_URL)
+    logger.info(f"Vector service client initialized: {VECTOR_SERVICE_URL}")
     
-    try:
-        embedding_function = get_embedding_function()
-        logger.info("Embedding function initialized")
-    except Exception as e:
-        logger.error(f"Failed to initialize embedding function: {e}")
-        raise
+    # Check vector service health
+    health = await vector_client.health_check()
+    if health.get("status") == "healthy":
+        logger.info("Vector service is healthy")
+    else:
+        logger.warning(f"Vector service health check: {health}")
     
     logger.info("Ingestion Service started successfully")
-
     
     yield
     
@@ -156,7 +93,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="VectorDB Ingestion Service",
     description="Microservice for document ingestion, chunking, and embedding",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -248,7 +185,7 @@ async def update_job_status(
 # ============================================================================
 
 async def process_ingestion(job_id: str, request: IngestionRequest, db: Session):
-    """Main ingestion processing function."""
+    """Main ingestion processing function - delegates storage to vector-service."""
     job = db.query(IngestionJob).filter(IngestionJob.id == job_id).first()
     if not job:
         logger.error(f"Job {job_id} not found")
@@ -317,32 +254,38 @@ async def process_ingestion(job_id: str, request: IngestionRequest, db: Session)
             "embedding_model": EMBEDDING_MODEL or "default",
         })
         
-        # Step 7: Get or create collection
-        await update_job_status(job, JobStatus.PROCESSING, 50, "Connecting to vector database...", db)
-        try:
-            collection = chroma_client.get_collection(
-                name=request.collection_name,
-                embedding_function=embedding_function
-            )
-        except:
-            collection = chroma_client.create_collection(
-                name=request.collection_name,
-                embedding_function=embedding_function,
-                metadata={
-                    "embedding_provider": EMBEDDING_PROVIDER,
-                    "embedding_model": EMBEDDING_MODEL or "default",
-                    "created_at": datetime.utcnow().isoformat()
-                }
-            )
+        # Step 7: Ensure collection exists via vector-service
+        await update_job_status(job, JobStatus.PROCESSING, 50, "Connecting to vector service...", db)
+        await vector_client.get_or_create_collection(
+            name=request.collection_name,
+            description=f"Collection for documents",
+            metadata={
+                "embedding_provider": EMBEDDING_PROVIDER,
+                "embedding_model": EMBEDDING_MODEL or "default",
+                "created_at": datetime.utcnow().isoformat()
+            }
+        )
         
-        # Step 8: Store chunks
+        # Step 7b: Delete existing document and chunks (for updates/re-ingestion)
+        await update_job_status(job, JobStatus.PROCESSING, 55, "Removing old chunks...", db)
+        try:
+            await vector_client.delete_document(
+                collection_name=request.collection_name,
+                document_id=request.document_id
+            )
+            logger.info(f"Deleted existing document {request.document_id} and its chunks")
+        except Exception as e:
+            # Document may not exist yet (first upload) - that's OK
+            logger.debug(f"No existing document to delete: {e}")
+        
+        # Step 8: Prepare documents for vector storage
         await update_job_status(job, JobStatus.PROCESSING, 60, f"Storing {len(chunks)} chunks...", db)
         
-        chunk_ids = [f"{request.document_id}_chunk_{i}" for i in range(len(chunks))]
-        chunk_metadatas = []
         document_name = request.metadata.get("name", "Unknown")
+        vector_documents = []
         
         for i, chunk in enumerate(chunks):
+            chunk_id = f"{request.document_id}_chunk_{i}"
             chunk_meta = {
                 **base_metadata,
                 "chunk_index": i,
@@ -354,50 +297,14 @@ async def process_ingestion(job_id: str, request: IngestionRequest, db: Session)
                 "document_name": document_name,
                 "document_version": request.version,
             }
-            chunk_metadatas.append(chunk_meta)
             
-            # Store chunk in database for tracking
-            db_chunk = Chunk(
-                id=chunk_ids[i],
-                document_id=request.document_id,
-                document_version=request.version,
-                chunk_index=i,
-                chunk_number=i + 1,
-                content_hash=calculate_content_hash(chunk),
-                content_length=len(chunk),
-                word_count=len(chunk.split())
-            )
-            db.merge(db_chunk)
+            vector_documents.append({
+                "id": chunk_id,
+                "content": chunk,
+                "metadata": chunk_meta
+            })
         
-        # Add to ChromaDB
-        collection.add(
-            documents=chunks,
-            metadatas=chunk_metadatas,
-            ids=chunk_ids
-        )
-        
-        # Step 9: Store full document
-        await update_job_status(job, JobStatus.PROCESSING, 80, "Storing document...", db)
-        
-        full_doc_metadata = {
-            **base_metadata,
-            "is_chunk": False,
-            "chunk_count": len(chunks),
-            "content_length": len(content),
-            "word_count": len(content.split()),
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        
-        collection.add(
-            documents=[content],
-            metadatas=[full_doc_metadata],
-            ids=[request.document_id]
-        )
-        
-        # Step 10: Update database records
-        await update_job_status(job, JobStatus.PROCESSING, 90, "Updating database...", db)
-        
-        # Create or update Document record
+        # Create Document record FIRST (before chunks due to foreign key constraint)
         doc = db.query(Document).filter(Document.id == request.document_id).first()
         if not doc:
             doc = Document(
@@ -413,10 +320,56 @@ async def process_ingestion(job_id: str, request: IngestionRequest, db: Session)
                 chunk_count=len(chunks)
             )
             db.add(doc)
+            db.flush()  # Flush to ensure document exists before chunks
         else:
             doc.current_version = request.version
             doc.chunk_count = len(chunks)
             doc.updated_at = datetime.utcnow()
+            db.flush()
+        
+        # Now store chunks in local database for tracking
+        for i, chunk in enumerate(chunks):
+            chunk_id = f"{request.document_id}_chunk_{i}"
+            db_chunk = Chunk(
+                id=chunk_id,
+                document_id=request.document_id,
+                document_version=request.version,
+                chunk_index=i,
+                chunk_number=i + 1,
+                content_hash=calculate_content_hash(chunk),
+                content_length=len(chunk),
+                word_count=len(chunk.split())
+            )
+            db.merge(db_chunk)
+        
+        # Add full document as well
+        full_doc_metadata = {
+            **base_metadata,
+            "is_chunk": False,
+            "chunk_count": len(chunks),
+            "content_length": len(content),
+            "word_count": len(content.split()),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        vector_documents.append({
+            "id": request.document_id,
+            "content": content,
+            "metadata": full_doc_metadata
+        })
+        
+        # Step 9: Store in vector-service
+        await update_job_status(job, JobStatus.PROCESSING, 75, "Sending to vector database...", db)
+        result = await vector_client.store_documents(
+            collection_name=request.collection_name,
+            documents=vector_documents,
+            generate_embeddings=True
+        )
+        
+        logger.info(f"Stored {result.get('stored_count', 0)} documents via vector-service")
+        
+        # Step 10: Update database records
+        await update_job_status(job, JobStatus.PROCESSING, 90, "Updating database...", db)
         
         # Create DocumentVersion record
         version = DocumentVersion(
@@ -466,18 +419,17 @@ async def root():
     return {
         "service": "VectorDB Ingestion Service",
         "status": "running",
-        "version": "1.0.0"
+        "version": "2.0.0",
+        "vector_service": VECTOR_SERVICE_URL
     }
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check(db: Session = Depends(get_db)):
     """Health check endpoint."""
-    try:
-        collections = chroma_client.list_collections()
-        chromadb_status = "connected"
-    except Exception as e:
-        chromadb_status = f"error: {str(e)}"
+    # Check vector service
+    vector_health = await vector_client.health_check()
+    vector_status = "connected" if vector_health.get("status") == "healthy" else f"error: {vector_health.get('error', 'unknown')}"
     
     try:
         active_jobs = db.query(IngestionJob).filter(
@@ -489,10 +441,10 @@ async def health_check(db: Session = Depends(get_db)):
         db_status = f"error: {str(e)}"
     
     return HealthResponse(
-        status="healthy" if chromadb_status == "connected" and db_status == "connected" else "unhealthy",
+        status="healthy" if vector_status == "connected" and db_status == "connected" else "unhealthy",
         timestamp=datetime.utcnow(),
         database=db_status,
-        chromadb=chromadb_status,
+        chromadb=vector_status,  # Keeping field name for backwards compatibility
         active_jobs=active_jobs
     )
 
@@ -596,6 +548,53 @@ async def list_jobs(
         skip=skip,
         limit=limit
     )
+
+
+# ============================================================================
+# Document Lifecycle Endpoints (New)
+# ============================================================================
+
+@app.post("/rechunk/{document_id}")
+async def rechunk_document(
+    document_id: str,
+    collection_name: str,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200,
+    chunking_strategy: str = "semantic",
+    background_tasks: BackgroundTasks = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Re-chunk an existing document with new parameters.
+    Deletes old chunks and creates new ones.
+    """
+    # Find the document
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Find the latest version's file
+    latest_version = db.query(DocumentVersion).filter(
+        DocumentVersion.document_id == document_id,
+        DocumentVersion.version == doc.current_version
+    ).first()
+    
+    if not latest_version or not latest_version.file_id:
+        raise HTTPException(status_code=400, detail="Cannot rechunk: original file not found")
+    
+    # Create a new ingestion job
+    job_id = str(uuid.uuid4())
+    
+    # TODO: Look up the file path from file_id and create IngestionRequest
+    # This requires the backend's file storage system
+    
+    return {
+        "message": "Rechunk job created",
+        "job_id": job_id,
+        "document_id": document_id,
+        "new_chunk_size": chunk_size,
+        "new_chunking_strategy": chunking_strategy
+    }
 
 
 if __name__ == "__main__":

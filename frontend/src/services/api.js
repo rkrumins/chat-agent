@@ -98,7 +98,7 @@ export const documentsAPI = {
   },
 };
 
-// Tasks API
+// Tasks API (legacy - local ingestion service)
 export const tasksAPI = {
   getStatus: async (taskId) => {
     const response = await api.get(`/tasks/${taskId}/status`);
@@ -108,6 +108,44 @@ export const tasksAPI = {
   list: async (status = null) => {
     const params = status ? { status } : {};
     const response = await api.get('/tasks', { params });
+    return response.data;
+  },
+};
+
+// Jobs API (persistent - vector service queue)
+const VECTOR_SERVICE_URL = process.env.REACT_APP_VECTOR_SERVICE_URL || 'http://localhost:8003';
+
+export const jobsAPI = {
+  // Get full job history with pagination
+  getHistory: async (status = null, limit = 50, offset = 0) => {
+    const params = { limit, offset };
+    if (status) params.status = status;
+
+    const response = await axios.get(`${VECTOR_SERVICE_URL}/jobs/history`, { params });
+    return response.data;
+  },
+
+  // Get job statistics by status
+  getStats: async () => {
+    const response = await axios.get(`${VECTOR_SERVICE_URL}/jobs/stats`);
+    return response.data;
+  },
+
+  // Get specific job status
+  getJob: async (jobId) => {
+    const response = await axios.get(`${VECTOR_SERVICE_URL}/jobs/${jobId}`);
+    return response.data;
+  },
+
+  // Get worker pool status
+  getWorkerStatus: async () => {
+    const response = await axios.get(`${VECTOR_SERVICE_URL}/jobs`);
+    return response.data;
+  },
+
+  // Cancel a pending job
+  cancelJob: async (jobId) => {
+    const response = await axios.post(`${VECTOR_SERVICE_URL}/jobs/${jobId}/cancel`);
     return response.data;
   },
 };
