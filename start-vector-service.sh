@@ -27,10 +27,16 @@ export CHROMA_DB_PATH=${CHROMA_DB_PATH:-"./chroma_db"}
 export EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-"sentence-transformers"}
 export LOG_LEVEL=${LOG_LEVEL:-"INFO"}
 
+# Worker Pool Configuration
+export WORKER_COUNT=${WORKER_COUNT:-"2"}          # Number of parallel workers
+export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-"50"} # Documents per batch
+
 echo "Starting Vector Service..."
 echo "  Backend: $VECTOR_BACKEND"
 echo "  ChromaDB Path: $CHROMA_DB_PATH"
 echo "  Embedding Provider: $EMBEDDING_PROVIDER"
+echo "  Worker Count: $WORKER_COUNT"
+echo "  Batch Size: $WORKER_BATCH_SIZE"
 echo ""
 
 # Run the service

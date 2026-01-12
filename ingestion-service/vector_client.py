@@ -4,6 +4,7 @@ Handles communication with the vector-service via REST API.
 """
 
 import os
+import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 
@@ -38,18 +39,102 @@ class VectorServiceClient:
         self,
         collection_name: str,
         documents: List[Dict[str, Any]],
-        generate_embeddings: bool = True
+        generate_embeddings: bool = True,
+        callback_url: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Store documents (chunks) in the vector database.
+        Store documents (chunks) in the vector database using async job queue.
+        Submits job and polls for completion.
         
         Args:
             collection_name: Target collection
             documents: List of document dicts with id, content, metadata
             generate_embeddings: Whether to generate embeddings
+            callback_url: Optional URL for progress callbacks
             
         Returns:
             Response with stored_count and document_ids
+        """
+        # Submit async job
+        job_payload = {
+            "collection_name": collection_name,
+            "documents": documents,
+            "callback_url": callback_url,
+            "batch_size": 50  # Process in batches of 50
+        }
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                # Submit job
+                response = await client.post(
+                    f"{self.base_url}/jobs",
+                    json=job_payload,
+                    timeout=30.0
+                )
+                
+                if response.status_code != 200:
+                    logger.error(f"Failed to submit job: {response.status_code} - {response.text}")
+                    raise Exception(f"Failed to submit job: {response.text}")
+                
+                job_data = response.json()
+                job_id = job_data['job_id']
+                logger.info(f"Submitted async job {job_id} for {len(documents)} documents")
+                
+                # Poll for completion
+                poll_interval = 2.0  # Start with 2 second intervals
+                max_wait = 600.0  # 10 minute max wait
+                waited = 0.0
+                
+                while waited < max_wait:
+                    await asyncio.sleep(poll_interval)
+                    waited += poll_interval
+                    
+                    status_response = await client.get(
+                        f"{self.base_url}/jobs/{job_id}",
+                        timeout=10.0
+                    )
+                    
+                    if status_response.status_code != 200:
+                        logger.warning(f"Failed to get job status: {status_response.status_code}")
+                        continue
+                    
+                    status_data = status_response.json()
+                    status = status_data.get('status')
+                    progress = status_data.get('progress_percent', 0)
+                    
+                    logger.info(f"Job {job_id}: {status} ({progress:.1f}%)")
+                    
+                    if status == 'completed':
+                        return {
+                            "stored_count": status_data.get('total_documents', len(documents)),
+                            "job_id": job_id,
+                            "message": "Documents stored successfully"
+                        }
+                    elif status == 'failed':
+                        error_msg = status_data.get('error_message', 'Unknown error')
+                        raise Exception(f"Vector job failed: {error_msg}")
+                    elif status == 'cancelled':
+                        raise Exception("Vector job was cancelled")
+                    
+                    # Adaptive polling - slow down after initial rapid checks
+                    if waited > 10:
+                        poll_interval = min(poll_interval * 1.5, 10.0)
+                
+                raise Exception(f"Timeout waiting for job {job_id} to complete")
+                
+        except httpx.RequestError as e:
+            logger.error(f"Failed to connect to vector service: {e}")
+            raise Exception(f"Failed to connect to vector service at {self.base_url}: {e}")
+    
+    async def store_documents_sync(
+        self,
+        collection_name: str,
+        documents: List[Dict[str, Any]],
+        generate_embeddings: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Store documents synchronously (blocking).
+        Use store_documents() for async non-blocking behavior.
         """
         payload = {
             "collection_name": collection_name,

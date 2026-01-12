@@ -33,6 +33,9 @@ from shared_schemas.collections import (
 
 from backends.chromadb_backend import ChromaDBBackend
 from embedding import get_embedding_function
+from job_queue import get_job_queue
+from job_models import JobStatus, VectorJobCreate, VectorJobResponse, VectorJobStatus
+from worker import init_worker, stop_worker, get_worker
 
 # Configuration
 VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chromadb")
@@ -78,9 +81,16 @@ async def lifespan(app: FastAPI):
     await vector_backend.initialize()
     logger.info("Vector service initialized successfully")
     
+    # Initialize and start background worker
+    init_worker(vector_backend, embedding_function)
+    logger.info("Background worker started")
+    
     yield
     
     # Cleanup
+    stop_worker()
+    logger.info("Background worker stopped")
+    
     if vector_backend:
         await vector_backend.cleanup()
     logger.info("Vector service shutdown complete")
@@ -418,6 +428,105 @@ async def get_stats():
         return stats
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Async Job Endpoints (Background Processing)
+# ============================================================================
+
+@app.post("/jobs", response_model=VectorJobResponse)
+async def submit_job(request: VectorJobCreate):
+    """
+    Submit documents for async background processing.
+    Returns immediately with a job ID for status tracking.
+    """
+    try:
+        queue = get_job_queue()
+        
+        job_id = queue.enqueue(
+            collection_name=request.collection_name,
+            documents=[doc.model_dump() if hasattr(doc, 'model_dump') else doc for doc in request.documents],
+            callback_url=request.callback_url,
+            batch_size=request.batch_size
+        )
+        
+        return VectorJobResponse(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            message="Job queued for background processing",
+            total_documents=len(request.documents)
+        )
+    except Exception as e:
+        logger.error(f"Error submitting job: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/jobs/{job_id}", response_model=VectorJobStatus)
+async def get_job_status(job_id: str):
+    """Get the status of a background processing job."""
+    try:
+        queue = get_job_queue()
+        job = queue.get_job(job_id)
+        
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        return VectorJobStatus(
+            job_id=job['id'],
+            status=JobStatus(job['status']),
+            collection_name=job['collection_name'],
+            total_documents=job['total_documents'],
+            processed_count=job['processed_count'],
+            progress_percent=job['progress_percent'],
+            error_message=job.get('error_message'),
+            created_at=job['created_at'],
+            started_at=job.get('started_at'),
+            completed_at=job.get('completed_at')
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting job status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a pending job."""
+    try:
+        queue = get_job_queue()
+        cancelled = queue.cancel_job(job_id)
+        
+        if cancelled:
+            return {"message": f"Job {job_id} cancelled", "cancelled": True}
+        else:
+            return {"message": f"Job {job_id} could not be cancelled (may already be processing)", "cancelled": False}
+    except Exception as e:
+        logger.error(f"Error cancelling job: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/jobs")
+async def list_jobs(status: str = None, limit: int = 50):
+    """List recent jobs and worker pool status."""
+    try:
+        queue = get_job_queue()
+        pending = queue.get_pending_count()
+        
+        worker_pool = get_worker()
+        if worker_pool:
+            pool_status = worker_pool.get_status()
+        else:
+            pool_status = {"num_workers": 0, "active_workers": 0, "running": False}
+        
+        return {
+            "pending_jobs": pending,
+            "worker_pool": pool_status,
+            "message": "Use GET /jobs/{job_id} to check specific job status"
+        }
+    except Exception as e:
+        logger.error(f"Error listing jobs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
