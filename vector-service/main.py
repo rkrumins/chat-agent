@@ -462,6 +462,86 @@ async def submit_job(request: VectorJobCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/jobs")
+async def list_jobs(status: str = None, limit: int = 50):
+    """List recent jobs and worker pool status."""
+    try:
+        queue = get_job_queue()
+        pending = queue.get_pending_count()
+        
+        worker_pool = get_worker()
+        if worker_pool:
+            pool_status = worker_pool.get_status()
+        else:
+            pool_status = {"num_workers": 0, "active_workers": 0, "running": False}
+        
+        return {
+            "pending_jobs": pending,
+            "worker_pool": pool_status,
+            "message": "Use GET /jobs/{job_id} to check specific job status"
+        }
+    except Exception as e:
+        logger.error(f"Error listing jobs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# IMPORTANT: These specific routes must come BEFORE /jobs/{job_id}
+@app.get("/jobs/history")
+async def get_job_history(
+    status: str = Query(None, description="Filter by status: pending, processing, completed, failed, cancelled"),
+    limit: int = Query(50, ge=1, le=200, description="Max jobs to return"),
+    offset: int = Query(0, ge=0, description="Number of jobs to skip"),
+    order_by: str = Query("created_at", description="Order by: created_at, started_at, completed_at")
+):
+    """
+    Get full job history with filtering and pagination.
+    Persisted across service restarts.
+    """
+    try:
+        queue = get_job_queue()
+        result = queue.list_jobs(
+            status=status,
+            limit=limit,
+            offset=offset,
+            order_by=order_by,
+            order_desc=True
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error getting job history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/jobs/stats")
+async def get_job_stats():
+    """Get job statistics by status."""
+    try:
+        queue = get_job_queue()
+        stats = queue.get_job_stats()
+        
+        worker_pool = get_worker()
+        if worker_pool:
+            stats["worker_pool"] = worker_pool.get_status()
+        
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting job stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/jobs/cleanup")
+async def cleanup_old_jobs(days: int = Query(7, ge=1, le=365, description="Delete jobs older than X days")):
+    """Clean up old completed/failed/cancelled jobs."""
+    try:
+        queue = get_job_queue()
+        deleted = queue.cleanup_old_jobs(days=days)
+        return {"deleted": deleted, "message": f"Cleaned up jobs older than {days} days"}
+    except Exception as e:
+        logger.error(f"Error cleaning up jobs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Parameterized routes must come AFTER specific routes
 @app.get("/jobs/{job_id}", response_model=VectorJobStatus)
 async def get_job_status(job_id: str):
     """Get the status of a background processing job."""
@@ -504,29 +584,6 @@ async def cancel_job(job_id: str):
             return {"message": f"Job {job_id} could not be cancelled (may already be processing)", "cancelled": False}
     except Exception as e:
         logger.error(f"Error cancelling job: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/jobs")
-async def list_jobs(status: str = None, limit: int = 50):
-    """List recent jobs and worker pool status."""
-    try:
-        queue = get_job_queue()
-        pending = queue.get_pending_count()
-        
-        worker_pool = get_worker()
-        if worker_pool:
-            pool_status = worker_pool.get_status()
-        else:
-            pool_status = {"num_workers": 0, "active_workers": 0, "running": False}
-        
-        return {
-            "pending_jobs": pending,
-            "worker_pool": pool_status,
-            "message": "Use GET /jobs/{job_id} to check specific job status"
-        }
-    except Exception as e:
-        logger.error(f"Error listing jobs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

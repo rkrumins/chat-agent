@@ -225,6 +225,99 @@ class JobQueue:
         
         return job
     
+    def list_jobs(
+        self,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        order_by: str = "created_at",
+        order_desc: bool = True
+    ) -> Dict[str, Any]:
+        """
+        List jobs with filtering and pagination.
+        
+        Args:
+            status: Filter by status (pending, processing, completed, failed, cancelled)
+            limit: Maximum number of jobs to return
+            offset: Number of jobs to skip
+            order_by: Column to order by (created_at, started_at, completed_at)
+            order_desc: True for descending order
+        
+        Returns:
+            Dict with jobs list and pagination info
+        """
+        conn = self._get_connection()
+        
+        # Build query
+        query = """
+            SELECT id, collection_name, status, total_documents, processed_count,
+                   error_message, created_at, started_at, completed_at
+            FROM vector_jobs
+        """
+        params = []
+        
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        
+        # Validate order_by to prevent SQL injection
+        valid_columns = ["created_at", "started_at", "completed_at", "status"]
+        if order_by not in valid_columns:
+            order_by = "created_at"
+        
+        order_dir = "DESC" if order_desc else "ASC"
+        query += f" ORDER BY {order_by} {order_dir}"
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        
+        cursor = conn.execute(query, params)
+        rows = cursor.fetchall()
+        
+        jobs = []
+        for row in rows:
+            job = dict(row)
+            # Calculate progress
+            if job['total_documents'] > 0:
+                job['progress_percent'] = round((job['processed_count'] / job['total_documents']) * 100, 1)
+            else:
+                job['progress_percent'] = 0
+            jobs.append(job)
+        
+        # Get total count for pagination
+        count_query = "SELECT COUNT(*) FROM vector_jobs"
+        count_params = []
+        if status:
+            count_query += " WHERE status = ?"
+            count_params.append(status)
+        
+        total = conn.execute(count_query, count_params).fetchone()[0]
+        
+        return {
+            "jobs": jobs,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(jobs) < total
+        }
+    
+    def get_job_stats(self) -> Dict[str, Any]:
+        """Get job statistics by status."""
+        conn = self._get_connection()
+        cursor = conn.execute("""
+            SELECT status, COUNT(*) as count
+            FROM vector_jobs
+            GROUP BY status
+        """)
+        
+        stats = {s.value: 0 for s in JobStatus}
+        for row in cursor.fetchall():
+            stats[row['status']] = row['count']
+        
+        return {
+            "by_status": stats,
+            "total": sum(stats.values())
+        }
+    
     def get_pending_count(self) -> int:
         """Get count of pending jobs."""
         conn = self._get_connection()
