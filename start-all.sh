@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Start all services for the VectorDB application with Python version check
+# Now includes vector-service for microservices architecture
 
 set -e
 
@@ -8,6 +9,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 echo "============================================"
 echo "  Starting VectorDB Application"
+echo "  (Microservices Architecture)"
 echo "============================================"
 echo ""
 
@@ -41,6 +43,38 @@ check_port() {
     lsof -ti:$1 > /dev/null 2>&1
 }
 
+# Install shared_schemas as a local package if not already installed
+echo "Installing shared_schemas package..."
+cd "$SCRIPT_DIR/shared_schemas"
+pip install -q -e . 2>/dev/null || true
+cd "$SCRIPT_DIR"
+
+# Start Vector Service (NEW - must start before others)
+if check_port 8003; then
+    echo "⚠️  Vector Service already running on port 8003"
+else
+    echo "Starting Vector Service..."
+    cd "$SCRIPT_DIR/vector-service"
+    
+    if [ ! -d "venv" ]; then
+        echo "Creating Vector Service virtual environment..."
+        $PYTHON_CMD -m venv venv
+        source venv/bin/activate
+        pip install -q -r requirements.txt
+        pip install -q -e ../shared_schemas
+    else
+        source venv/bin/activate
+    fi
+    
+    $PYTHON_CMD -m uvicorn main:app --reload --host 0.0.0.0 --port 8003 &
+    VECTOR_PID=$!
+    echo "✓ Vector Service started (PID: $VECTOR_PID)"
+    deactivate
+    
+    # Wait a bit for vector service to be ready
+    sleep 2
+fi
+
 # Start Backend
 if check_port 8000; then
     echo "⚠️  Backend already running on port 8000"
@@ -54,6 +88,7 @@ else
     fi
     
     source venv/bin/activate
+    pip install -q -e ../shared_schemas 2>/dev/null || true
     $PYTHON_CMD -m uvicorn main:app --reload --host 0.0.0.0 --port 8000 &
     BACKEND_PID=$!
     echo "✓ Backend started (PID: $BACKEND_PID)"
@@ -72,6 +107,7 @@ else
         $PYTHON_CMD -m venv venv
         source venv/bin/activate
         pip install -q -r requirements.txt
+        pip install -q -e ../shared_schemas
     else
         source venv/bin/activate
     fi
@@ -100,23 +136,21 @@ else
 fi
 
 
-# Start Chatbot
+# Start Chatbot (optional)
 if check_port 8001; then
     echo "⚠️  Chatbot already running on port 8001"
 else
-    echo "Starting Chatbot..."
-    cd "$SCRIPT_DIR/chatbot"
-    
-    if [ ! -d "venv" ]; then
-        echo "❌ Chatbot not set up. Run: ./setup-all.sh"
-        exit 1
+    if [ -d "$SCRIPT_DIR/chatbot" ] && [ -d "$SCRIPT_DIR/chatbot/venv" ]; then
+        echo "Starting Chatbot..."
+        cd "$SCRIPT_DIR/chatbot"
+        source venv/bin/activate
+        $PYTHON_CMD -m chainlit run rag_chatbot.py --host 0.0.0.0 --port 8001 &
+        CHATBOT_PID=$!
+        echo "✓ Chatbot started (PID: $CHATBOT_PID)"
+        deactivate
+    else
+        echo "⚠️  Chatbot not set up, skipping..."
     fi
-    
-    source venv/bin/activate
-    $PYTHON_CMD -m chainlit run rag_chatbot.py --host 0.0.0.0 --port 8001 &
-    CHATBOT_PID=$!
-    echo "✓ Chatbot started (PID: $CHATBOT_PID)"
-    deactivate
 fi
 
 cd "$SCRIPT_DIR"
@@ -128,12 +162,16 @@ echo "============================================"
 echo ""
 echo "Python version: $($PYTHON_CMD --version)"
 echo ""
-echo "Access the application:"
-echo "  Frontend:  http://localhost:3000"
-echo "  Backend:   http://localhost:8000"
-echo "  API Docs:  http://localhost:8000/docs"
-echo "  Ingestion: http://localhost:8002 (Document Processing Microservice)"
-echo "  Chatbot:   http://localhost:8001 (RAG Module with Multi-Collection Support)"
+echo "Microservices Architecture:"
+echo "  Vector Service:   http://localhost:8003 (Vector Database Layer)"
+echo "  Backend:          http://localhost:8000 (API Gateway)"
+echo "  Ingestion:        http://localhost:8002 (Document Processing)"
+echo "  Frontend:         http://localhost:3000"
+echo ""
+echo "API Documentation:"
+echo "  Backend:          http://localhost:8000/docs"
+echo "  Vector Service:   http://localhost:8003/docs"
+echo "  Ingestion:        http://localhost:8002/docs"
 echo ""
 echo "Press Ctrl+C to stop all services"
 echo ""
